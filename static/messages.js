@@ -34,10 +34,10 @@ function _markActiveSessionViewedOnReturn() {
 
 document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);
 window.addEventListener('focus', _markActiveSessionViewedOnReturn);
-// TTS: pause speech synthesis when user focuses the composer (#499)
+// TTS: pause playback when user focuses the composer (#499)
 const _msgEl=document.getElementById('msg');
-if(_msgEl) _msgEl.addEventListener('focus', ()=>{ if('speechSynthesis' in window && speechSynthesis.speaking) speechSynthesis.pause(); });
-if(_msgEl) _msgEl.addEventListener('blur', ()=>{ if('speechSynthesis' in window && speechSynthesis.paused) speechSynthesis.resume(); });
+if(_msgEl) _msgEl.addEventListener('focus', ()=>{ if(typeof _ttsCurrentAudio!=='undefined' && _ttsCurrentAudio && !_ttsCurrentAudio.paused) _ttsCurrentAudio.pause(); });
+if(_msgEl) _msgEl.addEventListener('blur', ()=>{ if(typeof _ttsCurrentAudio!=='undefined' && _ttsCurrentAudio && _ttsCurrentAudio.paused) _ttsCurrentAudio.play().catch(()=>{}); });
 
 async function send(){
   const text=$('msg').value.trim();

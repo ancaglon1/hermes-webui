@@ -447,7 +447,7 @@ window._micPendingSend=window._micPendingSend||false;
 (function(){
   const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
   const hasSTT=!(!SpeechRecognition);
-  const hasTTS=!!('speechSynthesis' in window);
+  const hasTTS=true; // Piper TTS via backend /api/tts — always available
 
   // Need both STT and TTS for turn-based voice mode
   if(!hasSTT||!hasTTS) return;
@@ -628,29 +628,36 @@ window._micPendingSend=window._micPendingSend||false;
     }
     if(!clean){ _startListening(); return; }
 
-    const utter=new SpeechSynthesisUtterance(clean);
-
-    // Apply saved voice preferences
-    const savedVoice=localStorage.getItem('hermes-tts-voice');
-    const voices=speechSynthesis.getVoices();
-    if(savedVoice&&voices.length){
-      const match=voices.find(v=>v.name===savedVoice);
-      if(match) utter.voice=match;
-    }
-    const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
-    if(!isNaN(savedRate)) utter.rate=Math.min(2,Math.max(0.5,savedRate));
-    const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
-    if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
-
-    utter.onend=()=>{
-      // After speaking, go back to listening
-      if(_voiceModeActive) setTimeout(()=>_startListening(),500);
-    };
-    utter.onerror=()=>{
+    fetch('/api/tts', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:clean, voice:localStorage.getItem('hermes-tts-voice')||''})
+    })
+    .then(r=>{
+      if(!r.ok) throw new Error('TTS failed');
+      return r.blob();
+    })
+    .then(blob=>{
+      const url=URL.createObjectURL(blob);
+      const audio=new Audio(url);
+      const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
+      if(!isNaN(savedRate)) audio.playbackRate=Math.min(2,Math.max(0.5,savedRate));
+      audio.onended=()=>{
+        URL.revokeObjectURL(url);
+        if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+      };
+      audio.onerror=()=>{
+        URL.revokeObjectURL(url);
+        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      };
+      audio.play().catch(()=>{
+        URL.revokeObjectURL(url);
+        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      });
+    })
+    .catch(()=>{
       if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
-    };
-
-    speechSynthesis.speak(utter);
+    });
   }
 
   // Hook into response completion — observe when the agent finishes

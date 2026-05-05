@@ -1,8 +1,9 @@
 """
-Tests for #499: TTS playback of agent responses via Web Speech API.
+Tests for #499: TTS playback of agent responses via Piper backend.
 
 Verifies that TTS utility functions, speaker button rendering, and
-settings controls are present in the WebUI codebase.
+settings controls are present in the WebUI codebase. Now uses Piper
+TTS via the server-side /api/tts endpoint instead of browser speechSynthesis.
 """
 import os
 import re
@@ -49,13 +50,13 @@ class TestTtsUtilityFunctions:
         assert 'MEDIA:' in src and 'a file' in src, \
             "_stripForTTS must replace MEDIA: paths"
 
-    def test_uses_speech_synthesis(self):
-        """speakMessage must use window.speechSynthesis."""
+    def test_uses_piper_backend(self):
+        """speakMessage must POST to /api/tts (Piper backend)."""
         src = _read('ui.js')
-        assert 'SpeechSynthesisUtterance' in src, \
-            "speakMessage must create SpeechSynthesisUtterance"
-        assert 'speechSynthesis.speak' in src, \
-            "speakMessage must call speechSynthesis.speak"
+        assert "fetch('/api/tts'" in src or 'fetch("/api/tts"' in src, \
+            "speakMessage must call fetch to /api/tts"
+        assert 'New Audio(url)' in src, \
+            "speakMessage must create Audio element from blob URL"
 
 
 class TestTtsSpeakerButton:
@@ -109,15 +110,16 @@ class TestTtsSettings:
         assert 'settingsTtsVoice' in src, \
             "TTS voice selector not found in index.html"
 
+    def test_tts_piper_voice_desc(self):
+        """Voice description should mention Piper."""
+        src = _read('index.html')
+        assert 'Piper' in src and 'alba' in src, \
+            "Voice description should mention Piper TTS and the alba voice model"
+
     def test_tts_rate_slider(self):
         src = _read('index.html')
         assert 'settingsTtsRate' in src, \
             "TTS rate slider not found in index.html"
-
-    def test_tts_pitch_slider(self):
-        src = _read('index.html')
-        assert 'settingsTtsPitch' in src, \
-            "TTS pitch slider not found in index.html"
 
     def test_tts_settings_wired_in_panels(self):
         """TTS settings must be initialized in loadSettingsPanel."""
@@ -142,16 +144,10 @@ class TestTtsI18n:
         assert "tts_listen:" in src, \
             "tts_listen key not found in i18n.js"
 
-    def test_tts_not_supported_key(self):
-        src = _read('i18n.js')
-        assert "tts_not_supported:" in src, \
-            "tts_not_supported key not found in i18n.js"
-
     def test_tts_settings_keys(self):
         src = _read('i18n.js')
         for key in ['settings_label_tts', 'settings_label_tts_auto_read',
-                     'settings_label_tts_voice', 'settings_label_tts_rate',
-                     'settings_label_tts_pitch']:
+                     'settings_label_tts_voice', 'settings_label_tts_rate']:
             assert f"{key}:" in src, f"{key} not found in i18n.js"
 
 
@@ -166,10 +162,10 @@ class TestTtsAutoRead:
     def test_tts_pause_on_composer_focus(self):
         """Speech should pause when user focuses the composer."""
         src = _read('messages.js')
-        assert 'speechSynthesis.pause' in src, \
-            "speechSynthesis.pause not called in messages.js"
-        assert 'speechSynthesis.resume' in src, \
-            "speechSynthesis.resume not called in messages.js"
+        assert '_ttsCurrentAudio' in src, \
+            "_ttsCurrentAudio not referenced in messages.js"
+        assert 'pause()' in src, \
+            "pause() not called in messages.js"
 
 
 class TestTtsBoot:
@@ -179,6 +175,12 @@ class TestTtsBoot:
         src = _read('boot.js')
         assert '_applyTtsEnabled' in src, \
             "_applyTtsEnabled not called in boot.js"
+
+    def test_tts_availability_always_true(self):
+        """hasTTS is hardcoded true since Piper is always available."""
+        src = _read('boot.js')
+        assert 'hasTTS=true' in src or 'hasTTS = true' in src, \
+            "hasTTS should be hardcoded to true for Piper backend"
 
 
 class TestTtsStyles:
@@ -224,7 +226,7 @@ class TestIssue1409TtsToggleBodyClass:
         # Find the function body and check it doesn't set inline display
         # on individual buttons (the broken pattern).
         m = re.search(
-            r'function _applyTtsEnabled\([^)]*\)\s*\{(?P<body>[^}]*)\}',
+            r'function _applyTtsEnabled\([^)]*\)\s*\{\s*(?P<body>[^}]*)\}',
             src,
         )
         assert m, "_applyTtsEnabled function body not found in panels.js"

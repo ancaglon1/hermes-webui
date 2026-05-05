@@ -1887,6 +1887,9 @@ def handle_get(handler, parsed) -> bool:
             return True
         return j(handler, {"error": "not found"}, status=404)
 
+    if parsed.path == "/api/tts/voices":
+        return _handle_tts_voices(handler)
+
     if parsed.path == "/favicon.ico":
         static_root = Path(__file__).parent.parent / "static"
         ico_path = (static_root / "favicon.ico").resolve()
@@ -2621,6 +2624,9 @@ def handle_post(handler, parsed) -> bool:
         return handle_transcribe(handler)
 
     body = read_body(handler)
+
+    if parsed.path == "/api/tts":
+        return _handle_tts(handler, body)
 
     if parsed.path == "/api/session/new":
         try:
@@ -7236,3 +7242,120 @@ def _handle_mcp_server_update(handler, name, body):
     _save_yaml_config_file(_get_config_path(), cfg)
     reload_config()
     return j(handler, {"ok": True, "server": _server_summary(name, server_cfg)})
+
+
+# ── TTS endpoint ──────────────────────────────────────────────────────────
+
+def _handle_tts_voices(handler):
+    """Return list of available Piper voices as JSON."""
+    pip_dir = os.path.expanduser('~/piper/piper')
+    voices_dir = os.path.join(pip_dir, 'voices')
+    voices = []
+    if os.path.isdir(voices_dir):
+        for f in sorted(os.listdir(voices_dir)):
+            if f.endswith('.onnx'):
+                name = f[:-5]  # strip .onnx
+                json_path = os.path.join(voices_dir, f + '.json')
+                meta = {}
+                if os.path.isfile(json_path):
+                    try:
+                        with open(json_path) as jf:
+                            meta = json.load(jf)
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                display_name = name
+                lang = meta.get('language', {}).get('name_english', '')
+                dataset = meta.get('dataset', '')
+                quality = meta.get('audio', {}).get('quality', '')
+                country = meta.get('language', {}).get('country_english', '')
+                if lang:
+                    display_name = lang
+                    if country and country != lang:
+                        display_name += f" ({country})"
+                    if dataset:
+                        display_name += f" — {dataset}"
+                    if quality:
+                        display_name += f" ({quality})"
+                elif dataset:
+                    display_name = dataset
+                voices.append({
+                    'id': name,
+                    'display_name': display_name,
+                    'language': meta.get('language', {}),
+                    'quality': quality,
+                    'dataset': dataset,
+                    'num_speakers': meta.get('num_speakers', 1),
+                })
+    return j(handler, {'voices': voices, 'default': 'en_GB-alba-medium'})
+
+
+def _handle_tts(handler, body):
+    """Synthesize text to speech via Piper, return OGG Opus audio."""
+    import tempfile
+
+    text = (body.get('text') or '').strip()
+    if not text:
+        return bad(handler, 'text is required')
+    if len(text) > 5000:
+        return bad(handler, 'text too long (max 5000 chars)')
+
+    pip_dir = os.path.expanduser('~/piper/piper')
+    voice_name = (body.get('voice') or 'en_GB-alba-medium').strip()
+    if not voice_name.endswith('.onnx'):
+        voice_name += '.onnx'
+    voice = os.path.join(pip_dir, 'voices', voice_name)
+
+    if not os.path.isfile(voice):
+        return bad(handler, 'TTS voice not found', status=503)
+
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = pip_dir
+
+    # Write text to a temp file so piper can read it cleanly (avoids
+    # subprocess pipe deadlocks with the piper→ffmpeg pipeline).
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+    try:
+        tmp.write(text)
+        tmp.close()
+
+        with open(tmp.name) as text_file:
+            piper = subprocess.Popen(
+                ['./piper', '--model', voice, '--output-raw',
+                 '--sentence-silence', '0.4', '-f', '-'],
+                stdin=text_file, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, cwd=pip_dir, env=env,
+            )
+            ffmpeg = subprocess.Popen(
+                ['ffmpeg', '-y', '-f', 's16le', '-ar', '22050', '-ac', '1',
+                 '-i', '-', '-c:a', 'libopus', '-b:a', '24k', '-f', 'ogg', '-'],
+                stdin=piper.stdout, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            piper.stdout.close()
+            audio_data = ffmpeg.communicate()[0]
+            piper.wait()
+    except FileNotFoundError:
+        return bad(handler, 'TTS binary not found', status=503)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        # Clean up lingering processes if anything went wrong
+        for _p in (piper, ffmpeg):
+            if _p.poll() is None:
+                _p.kill()
+                _p.wait()
+
+    if ffmpeg.returncode != 0 or piper.returncode != 0:
+        return bad(handler, 'TTS synthesis failed', status=500)
+
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'audio/ogg')
+    handler.send_header('Content-Length', str(len(audio_data)))
+    handler.send_header('Cache-Control', 'no-store')
+    from api.helpers import _security_headers
+    _security_headers(handler)
+    handler.end_headers()
+    handler.wfile.write(audio_data)
+    return True

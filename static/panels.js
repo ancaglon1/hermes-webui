@@ -3165,25 +3165,28 @@ async function loadSettingsPanel(){
         if(typeof window._applyVoiceModePref==='function') window._applyVoiceModePref();
       };
     }
-    // Populate voice selector from speechSynthesis
+    // Piper TTS voice selector — fetch available voices from backend
     const ttsVoiceSel=$('settingsTtsVoice');
-    if(ttsVoiceSel&&'speechSynthesis' in window){
-      const populateVoices=()=>{
-        const voices=speechSynthesis.getVoices();
-        const current=localStorage.getItem('hermes-tts-voice')||'';
-        ttsVoiceSel.innerHTML='<option value="">Default system voice</option>';
-        voices.forEach(v=>{
+    if(ttsVoiceSel){
+      ttsVoiceSel.innerHTML='<option value="" disabled>Loading voices…</option>';
+      fetch('/api/tts/voices').then(r=>r.json()).then(data=>{
+        ttsVoiceSel.innerHTML='';
+        data.voices.forEach(v=>{
           const opt=document.createElement('option');
-          opt.value=v.name;opt.textContent=v.name+(v.lang?' ('+v.lang+')':'');
-          if(v.name===current) opt.selected=true;
+          opt.value=v.id;
+          opt.textContent=v.display_name;
+          if(v.id===data.default) opt.selected=true;
           ttsVoiceSel.appendChild(opt);
         });
-      };
-      populateVoices();
-      speechSynthesis.addEventListener('voiceschanged',populateVoices,{once:true});
+        // Restore saved preference
+        const saved=localStorage.getItem('hermes-tts-voice');
+        if(saved&&data.voices.some(v=>v.id===saved)) ttsVoiceSel.value=saved;
+      }).catch(()=>{
+        ttsVoiceSel.innerHTML='<option value="" selected>Piper (en_GB-alba-medium · Scottish English female)</option>';
+      });
       ttsVoiceSel.onchange=function(){localStorage.setItem('hermes-tts-voice',this.value);};
     }
-    // TTS rate/pitch sliders
+    // TTS playback speed slider (applied to Audio playbackRate)
     const ttsRateSlider=$('settingsTtsRate');
     const ttsRateValue=$('settingsTtsRateValue');
     if(ttsRateSlider){
@@ -3191,14 +3194,6 @@ async function loadSettingsPanel(){
       ttsRateSlider.value=savedRate||'1';
       if(ttsRateValue) ttsRateValue.textContent=parseFloat(ttsRateSlider.value).toFixed(1)+'x';
       ttsRateSlider.oninput=function(){if(ttsRateValue)ttsRateValue.textContent=parseFloat(this.value).toFixed(1)+'x';localStorage.setItem('hermes-tts-rate',this.value);};
-    }
-    const ttsPitchSlider=$('settingsTtsPitch');
-    const ttsPitchValue=$('settingsTtsPitchValue');
-    if(ttsPitchSlider){
-      const savedPitch=localStorage.getItem('hermes-tts-pitch');
-      ttsPitchSlider.value=savedPitch||'1';
-      if(ttsPitchValue) ttsPitchValue.textContent=parseFloat(ttsPitchSlider.value).toFixed(1);
-      ttsPitchSlider.oninput=function(){if(ttsPitchValue)ttsPitchValue.textContent=parseFloat(this.value).toFixed(1);localStorage.setItem('hermes-tts-pitch',this.value);};
     }
     const notifCb=$('settingsNotificationsEnabled');
     if(notifCb){notifCb.checked=!!settings.notifications_enabled;notifCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
