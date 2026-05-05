@@ -2683,8 +2683,8 @@ function copyMsg(btn){
 function _stripForTTS(text){
   // Remove code blocks entirely (```) — line-anchored to match #1438 fix
   text=text.replace(/(^|\n)[ ]{0,3}```(?:[\s\S]*?\n)?[ ]{0,3}```(?=\n|$)/g,' ');
-  // Remove inline code
-  text=text.replace(/`[^`]+`/g,' ');
+  // Unwrap inline code — keep the content so it's spoken
+  text=text.replace(/`([^`]+)`/g,'$1');
   // Strip bold/italic
   text=text.replace(/\*\*(.+?)\*\*/g,'$1');
   text=text.replace(/\*(.+?)\*/g,'$1');
