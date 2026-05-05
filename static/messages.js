@@ -110,6 +110,10 @@ async function send(){
     }
     return;
   }
+  if(S.session&&(S.session.read_only||S.session.is_read_only)){
+    if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000);
+    return;
+  }
   // Slash command intercept -- local commands handled without agent round-trip.
   // We push the user message BEFORE running the handler for echo-worthy
   // commands so chat order is correct: some handlers (e.g. cmdHelp) push
@@ -905,6 +909,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             }
             if(typeof d.usage.tps==='number'&&d.usage.tps>0){
               lastAsst._turnTps=d.usage.tps;
+            }
+            if(d.usage.gateway_routing){
+              lastAsst._gatewayRouting=d.usage.gateway_routing;
+              if(S.session)S.session.gateway_routing=d.usage.gateway_routing;
+              if(S.session&&Array.isArray(S.session.gateway_routing_history))S.session.gateway_routing_history.push(d.usage.gateway_routing);
+              else if(S.session)S.session.gateway_routing_history=[d.usage.gateway_routing];
             }
           }
         }

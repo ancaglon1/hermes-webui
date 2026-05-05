@@ -1,5 +1,230 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.3] — 2026-05-04 — 3-PR follow-up batch (#1671, #1673, #1676) + test-fragility fix
+
+### Added
+
+- **PR #1671** by @Michaelyklam — Active provider quota status (refs #706). New `GET /api/provider/quota?provider=X` endpoint with OpenRouter implementation: `_PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0`, server-side credentials only, sanitized output (`limit_remaining`, `usage`, `limit`, `status`). Safe states for no active provider, missing OpenRouter key, invalid key, timeout, unsupported provider. New "Active provider quota" card in Settings → Providers panel above existing provider cards. 7 regression tests pin route, success, error paths, and UI wiring.
+- **PR #1673** by @Michaelyklam — LLM Gateway routing metadata (refs #732). Surfaces gateway routing telemetry inline in chat without requiring refresh. New `Session.gateway_routing` (latest) + `Session.gateway_routing_history` (per-turn, capped at 50 entries). SSE `done` payload now carries `usage.gateway_routing`. Assistant message footers display served model+provider when failover or model-switch occurs. Sidebar session metadata uses gateway-aware label via `_formatSessionModelWithGateway(s)`. Bounded persistence: `routing` array capped at 12 attempts, scalar strings capped at 240 chars. 28 regression tests pin metadata capture, fallback, persistence, and display hooks.
+- **PR #1676** by @Michaelyklam — Hermes agent heartbeat alert (closes #716). New `api/agent_health.py` module with `health_check_agent()` returning `{alive, checked_at, details}` (alive can be `true`/`false`/`null`). Uses `gateway.status` runtime metadata + `get_running_pid(cleanup_stale=False)`. **No shell-outs, no psutil dependency** — explicit regression tests assert `"import psutil" not in src` and `"import subprocess" not in src` in agent_health.py. Sticky banner above composer (default-hidden) with 30s visible-tab polling and dismiss persistence. Visibility-tab gate prevents banner spam during background-tab idle. Allowlist-filtered runtime details (no `cwd`/`cmdline`/`environ`/`username`/`exe` leakage). 12 regression tests.
+
+### Fixed
+
+- **`tests/test_session_lineage_collapse.py` MAX_ARG_STRLEN failure** — Pre-existing test fragility: `_run_node` invoked `subprocess.run([NODE, "-e", source])` where `<source>` embeds the entire `static/sessions.js` content. Linux's `MAX_ARG_STRLEN` is 131,072 bytes per argv arg; with sessions.js plus the test scaffolding (eval'ing 5+ functions), the source string crossed that threshold after #1673's additions, producing `OSError: [Errno 7] Argument list too long`. Switched `_run_node` to pass source via stdin (no argv-size limit). No behavioral change to the tests themselves.
+
+### Pre-release verification
+
+- Full pytest sequential pass: 4457 → **4477 passing** (+20). 0 regressions.
+- JS syntax check on 4 modified `.js` files via `node -c`: all clean.
+- Python syntax check on 10 modified `.py` files: all compile clean.
+- QA harness: ALL CHECKS PASSED.
+- Live browser verification on 56-session sidebar:
+  - `/api/provider/quota` returns 200 with proper "No active provider" empty state. Settings → Providers shows quota card.
+  - `/api/health/agent` returns 200. Banner exists in DOM but `hidden=true` and not `.visible` (correct — agent healthy in fixture).
+  - All 4 gateway helpers (`_formatGatewayModelLabel`, `_gatewayRoutingFailoverText`, `_gatewayModelWarningText`, `_formatSessionModelWithGateway`) defined in global scope.
+  - Sidebar scroll fix from v0.51.2 still works (regression check).
+- Independent review: Opus advisor on stage-300 diff (1050 LOC). 7/7 verification questions verified clean: process-field filtering, OpenRouter error sanitization, gateway-model label correctness, sidebar fallback when no routing data, loop preamble + segments-map population, banner positioning, visibility-tab gate. **Verdict: SHIP.** 0 MUST-FIX, 0 SHOULD-FIX. Only nit: dead `position:sticky;bottom:0` on `.agent-health-banner` (harmless cosmetic CSS, deferred to follow-up).
+
+### Surgical conflict resolution highlights
+
+All 3 PRs branched off pre-v0.51.0 master and required surgical resolution:
+
+- **#1671 routes.py**: kept master's `_handle_plugins` route from v0.51.1 #1663 + added new quota route below (both routes preserved adjacent).
+- **#1673 sessions.js**: kept master's `_getChannelLabel` + `readOnly` metaBits AND swapped master's `if(s.model) metaBits.push(s.model)` for contributor's `_formatSessionModelWithGateway(s)` call. Net effect: gateway-aware model line + existing channel/readOnly bits preserved.
+- **#1673 ui.js**: 2 conflicts in the assistant-footer rebuild loop. Kept master's `renderedAssistantIdxs=[...assistantSegments.keys()].sort()` pattern (more robust than contributor's DOM-index-based `asstRows[ai]`), added contributor's gateway-routing extractions inside the loop. Footer skip-condition extended with `&&!gatewayText&&!failoverText&&!modelWarningText`. Selector check extended for new inline class names.
+- **#1676**: clean rebase, no conflicts.
+
+Both #1671, #1673, and #1676 rebased branches force-pushed back to @Michaelyklam's fork via maintainer write access, preserving `Co-authored-by:` attribution.
+
+### UX gate re-evaluation
+
+PRs #1671, #1673, #1676 had been UX-gated in the v0.51.1 sweep, then on second-look determined to NOT warrant the gate per the "main-conversation-view-only" threshold:
+- **#1671** is a Settings → Providers panel (not main conversation surface).
+- **#1673** adds metadata to assistant message footers, but only conditionally visible when failover or model-switch actually happens. Most users never see it.
+- **#1676** banner is `hidden` by default and only appears when agent becomes unreachable. Conditional safety indicator, not active UX surface.
+
+UX label cleared, Aron stand-down comments deleted on all 3, all 3 swept into this batch.
+
+
+## [v0.51.2] — 2026-05-04 — 3-PR follow-up batch (deferred from v0.51.1) + sidebar scroll hotfix
+
+### Fixed
+
+- **Sidebar scroll jumps back to 0 on small lists (≤80 sessions)** — PR #1669 added DOM virtualization to `renderSessionListFromCache()` with two flaws for lists below the virtualization threshold: (1) the unconditional scroll listener triggered a full DOM rebuild on every rAF, and (2) `scrollTop` was only restored when `virtualWindow.virtualized` was true (i.e. total > 80 rows). For lists ≤ 80 rows, `scrollTop` dropped to 0 on every scroll event, producing a "scroll keeps jumping back" feel. Two-part fix: (a) always restore `scrollTop` when `listScrollTopBeforeRender > 0` regardless of virtualized flag, (b) short-circuit `_scheduleSessionVirtualizedRender` when total ≤ `SESSION_VIRTUAL_THRESHOLD_ROWS` (saves the wasteful rebuild and is belt-and-suspenders defense). Live verified: production v0.51.1 confirmed broken (scrollTop drops to 0 within 100ms); v0.51.2 confirmed working (holds at 500 across 600ms+). 3 regression tests pin both fixes.
+
+### Added
+
+- **PR #1664** by @Michaelyklam — LLM Wiki status panel (closes #1257). New read-only Insights card showing wiki state (entries, pages, raw files, last updated, last writer) with traffic-light status badge ("Available" / "Empty" / "Unavailable" / "Error"). New `GET /api/wiki/status` endpoint reads `WIKI_PATH` env var or `skills.config.wiki.path` config, returns metadata-only counts. `loadInsights()` parallelizes the wiki status fetch with the existing `/api/insights` call via `Promise.all`, with a `.catch` fallback so wiki failures don't break Insights.
+- **PR #1662** by @Michaelyklam — Logs tab MVP (closes #1455). New top-level Logs tab in nav rail. Allowlisted server-side log file viewer (`agent` / `errors` / `gateway`) with severity highlighting (info/warning/error/debug), tail size selector (100/200/500/1000 lines), auto-refresh, copy-all. New `GET /api/logs` endpoint with strict allowlist + path-traversal guard + bounded 4 MiB tail window. 8 i18n locale entries added.
+- **PR #1587** by @franksong2702 — Filter low-value CLI agent sessions (refs #1013). Source-aware sidebar visibility rules for imported CLI agent sessions: hides empty CLI rows; hides default/untitled CLI rows with fewer than 2 user turns; keeps explicitly-titled CLI sessions; keeps compression-lineage CLI sessions. Treats true CLI-origin rows as external/imported in action menu (keeps pin/move/archive/restore, hides duplicate/delete). New `_isCliSession(session)` helper in static/sessions.js for source classification.
+
+### Pre-release verification
+
+- Full pytest sequential pass: 4429 → **4457 passing** (+28). 0 regressions.
+- JS syntax check on 6 modified `.js` files via `node -c`: all clean.
+- Python syntax check on 9 modified `.py` files: all clean.
+- QA harness: 20 pytest + 11 browser API + `/health` probe — ALL CHECKS PASSED.
+- Browser-driven smoke test on 56-session sidebar:
+  - Logs tab: panel renders with file/tail selectors; 4 test log lines (INFO/WARNING/ERROR/DEBUG) all rendered with correct severity classes.
+  - LLM Wiki card: renders in Insights tab with proper "Unavailable" state and 6-grid metadata layout. Existing Insights chart (#1668) renders unaffected.
+  - `_isCliSession` helper: 6/6 test cases correct (null, empty object, session_source=cli → true, raw_source=CLI → true, source_label=cli → true, raw_source=web → false).
+  - Sidebar scroll: scrollTop=500 holds steady across 100/300/600ms; scroll-to-bottom (1986) holds across 600ms.
+  - Path traversal: `/api/logs?file=../../etc/passwd` correctly returns HTTP 400.
+- Independent review: Opus advisor on stage-298 diff (1336 LOC). 6/6 verification questions resolved cleanly: SSRF safety, path traversal, schema redaction, JS XSS prevention, scroll-fix first-render edge case, CHANGELOG handling. **Verdict: SHIP.** 0 MUST-FIX, 2 SHOULD-FIX absorbed in-release (see below).
+
+### Opus-applied fixes (absorbed in-release)
+
+**From stage-299 absorption (this release):**
+- **Bounded WIKI_PATH walk + forbidden-root guard** (`api/routes.py`): `_LLM_WIKI_MAX_FILES = 10000` caps `rglob` iteration in both `_llm_wiki_count_files` and `_llm_wiki_page_files` (prevents hangs on symlink loops or pathologically-large trees). `_LLM_WIKI_FORBIDDEN_ROOTS` blocklist refuses `/`, `/etc`, `/usr`, `/var`, `/opt`, `/sys`, `/proc` even if `WIKI_PATH` is misconfigured to point at them. Self-DoS prevention: `/api/wiki/status` fires on every Insights tab open via `Promise.all`, and unbounded `rglob` on a misconfigured root would block the endpoint. 6 regression tests pin the constants + behavioral guards.
+- **URL-scheme guard for `docs_url` interpolation** (`static/panels.js`): `rawDocsUrl` is regex-validated against `/^https?:\/\//i` before being interpolated into the `<a href=>` attribute. `esc()` HTML-escapes but doesn't validate URL scheme; `docs_url` is server-controlled today but the contributor scaffolded it for potential config-driven use, so future-proofs against `js:` / `data:` scheme XSS.
+
+### Surgical conflict resolution
+
+All 3 PRs branched off pre-Kanban-v1 master, producing multi-region conflicts in `static/panels.js` and `static/style.css`. Resolved per-conflict surgically rather than via naive keep-both:
+
+- **#1664 panels.js**: kept master's modern `_renderInsights` body (preserves the v0.51.1 chart enhancements from #1668), modified its signature to accept `wikiStatus` as 3rd parameter, AND inserted the two new wiki helper functions (`_formatLlmWikiTimestamp`, `_renderLlmWikiStatus`) before it. Verified single `_renderInsights` definition.
+- **#1664 style.css**: kept master's `.insights-card { margin-bottom: 16px }` (used by other Insights cards) and ADDED all the new `.wiki-status-*` rules. Discarded contributor's modification of `.insights-card` (would have broken #1668 chart card spacing).
+- **#1662 panels.js**: panel-list array union'd to include both `'kanban'` (v0.51.0) and `'logs'` (this PR). Large additive region: kept BOTH the master's Kanban switcher/modal block AND the contributor's Logs panel block. Patched a missing pair of closing braces (`}\n}\n`) at the boundary where the conflict marker truncated `archiveKanbanBoard`.
+- **#1662 style.css**: display-none selector union'd to include `#mainInsights, #mainLogs` AND `:not(.showing-kanban):not(.showing-logs)` chain.
+- **#1587 sessions.js**: kept master's `_isReadOnlySession` and `_sourceKeyForSession` helpers AND added the new `_isCliSession` helper. Patched a missing closing brace on `_sourceKeyForSession` introduced by conflict-marker truncation.
+
+Both #1664 and #1662 rebased branches were force-pushed back to @Michaelyklam's fork via maintainer write access (preserving `Co-authored-by:` attribution). #1587 stayed local since the maintainer token doesn't have write access to franksong2702's fork.
+
+
+## [v0.51.1] — 2026-05-04 — 11-PR contributor batch from @Michaelyklam
+
+### Added — 11 PRs from a single overnight burst, all per-PR Phase-0 fit-screened
+
+- **#1672** by @Michaelyklam — `ctl.sh` daemon lifecycle script (start/stop/restart/status/logs). Closes #591.
+  - PID ownership via `~/.hermes/webui.pid` with stale-PID cleanup, SIGTERM wait + SIGKILL fallback.
+  - `status` combines local PID state with `/health` probe output.
+  - PID-reuse safety: signals only sent when args check confirms the PID's process is the WebUI.
+  - 195 LOC of tests using temp homes + fake bootstrap targets so no real WebUI is killed during testing.
+- **#1665** by @Michaelyklam — Windows WSL autostart helpers. Closes #513.
+  - `scripts/wsl/hermes_webui_autostart.sh` (lock file, health check, pid file) for WSL shell startup.
+  - `scripts/windows/setup_webui_autostart.ps1` (idempotent Task Scheduler helper, ShouldProcess/-WhatIf, MultipleInstances IgnoreNew) for Windows logon startup.
+  - `docs/wsl-autostart.md` covers both install paths and the diagnostic commands.
+- **#1666** by @Michaelyklam — DOM windowing for long sessions. Closes #734.
+  - `MESSAGE_RENDER_WINDOW_DEFAULT = 50`; renders only ~window of messages around viewport instead of all N.
+- **#1669** by @Michaelyklam — Sidebar list virtualization. Refs #500.
+  - 1000+ session sidebars now render with constant DOM size; spacers above/below the visible window.
+  - `selectAllSessions` updated to use `_sessionVisibleSidebarIds` so virtualization doesn't break "select all" silently.
+- **#1678** by @Michaelyklam — Claude Code session imports.
+  - Reads `~/.claude/projects/*.jsonl` and surfaces them in the sidebar with `data-source-key="claude_code"` styling.
+  - Read-only — no clone/duplicate/delete on Claude Code rows.
+  - HERMES_WEBUI_TEST_STATE_DIR explicitly disables real-home scan inside test envs.
+  - Symlink + oversized-file guards layered at root, project_dir, and file levels (no follow-symlink reads).
+- **#1663** by @Michaelyklam — Plugins visibility panel. Closes #539. Read-only Settings → System → Plugins panel showing plugin/hook config.
+- **#1670** by @Michaelyklam — MCP server visibility panel. Closes #696.
+  - Replaces the prior buggy add/delete UI with a read-only visibility panel.
+  - `GET /api/mcp/servers` extended with `enabled`, `active`, `status`, `tool_count`, `connect_timeout`, `toggle_supported: false`, `reload_required: true`.
+  - Backend add/delete tests preserved.
+- **#1679** by @Michaelyklam — MCP tool inventory. Refs #697 #696.
+  - Searchable Settings → System → MCP Tools panel.
+  - `GET /api/mcp/tools` with sanitized rows (tool name, source server, description, active/enabled/status, compact schema summary).
+  - Schema redaction: parameter name/type/required/description only; defaults/examples/raw schema OMITTED; descriptions Authorization-bearer-token redacted, capped at 180 chars/param + 360 chars/tool.
+- **#1667** by @Michaelyklam — `/status` slash-command card. Closes #463. Opt-in slash command shows session info card (model, provider, project, message count, tokens).
+- **#1668** by @Michaelyklam — Insights tab token trends + per-model cost breakdown. Closes #1456.
+  - Defense-in-depth empty-state handling: client guard `if (dailyTokens.length)`; `Math.max(..., 1)` to prevent division-by-zero; server-side `if total_tokens else 0` guards.
+- **#1674** by @Michaelyklam — Scheduled job profile selector in cron form. Refs #617.
+- **#1677** by @Michaelyklam — Official Hermes dashboard link in top-bar. Closes #1459.
+  - New `api/dashboard_probe.py` probes localhost:9119 for the Hermes Agent dashboard; shows "Dashboard ↗" link if running, hidden otherwise.
+  - SSRF-safe: `_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}`, `DEFAULT_DASHBOARD_TARGETS` only loopback, GET-only, hardcoded `/api/status` path, no DNS lookups outside loopback.
+
+### Tests
+
+4356 → **4429 passing** (+73 regression tests across all 11 PRs). 0 regressions on the full sequential suite. 2 skipped (env-dependent), 3 xpassed (expected failures that pass).
+
+### Pre-release verification
+
+- Full pytest sequential pass — 4429 passing, 0 failures, 113s runtime.
+- JS syntax check on 6 modified `.js` files — all parse clean (`node -c`).
+- Python syntax check on 19 modified `.py` files — all compile clean.
+- QA harness: 20 pytest + 11 browser API checks + `/health` probe — ALL CHECKS PASSED.
+- **Independent review**: Opus advisor on stage-298 diff (4749 LOC). 6/6 security/correctness questions verified clean: SSRF safety on dashboard probe, Claude Code symlink guards, MCP tool schema redaction, ctl.sh PID identity check, sidebar virtualization correctness, Insights division-by-zero. **Verdict: SHIP.** No MUST-FIX or SHOULD-FIX flagged. Two non-blocking polish notes deferred to follow-up: optional post-DNS IP-validation on `dashboard_probe`, and macOS `ps -ww` for ctl.sh args inspection.
+
+### Deferred from this batch
+
+- **#1664** (LLM Wiki status panel) and **#1662** (Logs tab MVP): Both contributor branches predated the v0.51.0 Kanban v1 merge from earlier today. The resulting multi-conflict regions in `static/panels.js` (panel-list array + section-marker block + `archiveKanbanBoard` function boundary) needed careful per-conflict surgery that's better handled as standalone follow-up work. Posted detailed deferral comments on each PR offering either contributor-rebase or maintainer-takes-it.
+- **#1587** (CLI session filter): CONFLICTING — comment posted requesting rebase.
+
+### Author note
+
+This release ships a contributor-burst pattern (17 PRs from @Michaelyklam in 51 minutes overnight). Despite the volume, per-PR claim-vs-diff verification showed no AI-tells, all PR descriptions matched their diffs, all `closes #N` references pointed at real open issues, and security-relevant code paths (file-system reads, outbound HTTP, PID handling, schema redaction) check out under independent review. Eleven PRs landed cleanly in this batch; the remaining six were either deferred for conflict resolution or already in held-state with maintainer-review labels.
+
+
+## [v0.51.0] — 2026-05-04 — Kanban v1
+
+### Added — Kanban v1: complete first-party Kanban for Hermes (closes #1645, #1646, #1647, #1649, #1654, #1655, #1660, #1675)
+
+The full Kanban feature lands as a 12-commit stack giving the WebUI **first-party-compatible parity** with the Hermes Agent dashboard plugin's Kanban surface. A small team can now run their entire ticket-tracking flow directly inside the WebUI panel, sharing a single source of truth (`~/.hermes/kanban.db` + per-board `~/.hermes/kanban/boards/<slug>/kanban.db`) with the agent CLI, gateway slash commands, and dashboard.
+
+**Stacked on previously-shipped foundation** (v0.50.275–v0.50.297 introduced read-only Kanban panel, write semantics, task detail expansion, dashboard-parity core controls, UI parity polish, and review-feedback hardening). This release completes the picture with multi-board management and real-time event streaming.
+
+**Multi-board management** (#1675, ~1900 LOC of new feature work):
+
+- 5 new endpoints mirroring the agent dashboard plugin contract verbatim:
+  - `GET /api/kanban/boards` — list all boards with per-status task counts + active-board pointer
+  - `POST /api/kanban/boards` — create board (idempotent on slug)
+  - `PATCH /api/kanban/boards/<slug>` — rename / update display metadata (slug is immutable)
+  - `DELETE /api/kanban/boards/<slug>` — archive (default; reversible from `kanban/boards/_archived/`) or `?delete=1` hard-delete
+  - `POST /api/kanban/boards/<slug>/switch` — set active board (writes shared cross-process pointer at `<root>/kanban/current`)
+- All existing per-board endpoints accept `?board=<slug>` query param (or `board` in JSON body); query takes precedence over body
+- Frontend: `Default ▾` switcher pill in the panel header, click-anchored menu listing every board (current first) with per-status total badges + 3 actions (New / Rename / Archive). Modal handles both create and rename (slug auto-derives from name with manual override). Archive routes through the existing `showConfirmDialog` with a clear "tasks remain on disk and the board can be restored from kanban/boards/_archived/" message.
+- Active-board state persists to `localStorage['hermes-kanban-active-board']` so a refresh stays put. The on-disk pointer is the cross-process source of truth, kept in sync via the switch endpoint.
+- Default board is protected from deletion (would leave system without fallback active board).
+- Slug normalisation goes through `kb._normalize_board_slug()` which rejects path-traversal patterns (`../etc/passwd`, `..\windows`) at validation time.
+
+**Real-time SSE event stream** (#1675):
+
+- New `GET /api/kanban/events/stream` long-lived Server-Sent Events endpoint mirroring the agent dashboard's WebSocket `/events` contract event-for-event
+- 300ms server-side poll interval (matches agent dashboard's `_EVENT_POLL_SECONDS`), 200-event batch cap, 15s heartbeat keepalive
+- Each `event: events` frame emits `id: <event_id>` so EventSource auto-stores `Last-Event-ID` and resumes from the right cursor on reconnect; server reads `Last-Event-ID` from request headers as a fallback when `?since=` is absent (cross-drop resume without re-streaming the backlog)
+- Frontend uses `EventSource` by default with **automatic fallback to 30s HTTP polling** after 3 consecutive SSE failures (proxy strips `text/event-stream`, etc.)
+- 250ms debounce on event bursts coalesces N events into a single board re-fetch
+- SSE stream torn down cleanly when the user leaves the Kanban panel (no leaked threads on a long-running session)
+- **Why SSE not WebSocket**: the WebUI's existing transport is synchronous `BaseHTTPServer`. WebSocket would require an async refactor or a hijack-the-socket hack. SSE is the right tool for unidirectional server-pushed event streams, matches the existing `/api/approval/stream` and `/api/clarify/stream` patterns, and gives identical write-to-receive latency (~300ms) versus the agent dashboard's WebSocket path.
+
+**Bridge hardening** (#1660 + #1675 polish):
+
+- `read_only` flag now reports honest state across all 4 payload sites (`_board_payload`, `_events_payload`, `_task_log_payload`, no-change short-circuit). Was hardcoded `True` from the read-only-bridge era of #1645; bridge has been writable since #1649.
+- `ImportError` fallback: when `hermes_cli` isn't installed (webui-only deploy), all 4 verb handlers (GET/POST/PATCH/DELETE) return clean `503 kanban unavailable: <reason>` instead of bubbling 500s.
+- **Dispatcher contract enforcement** (a39ec45): bridge rejects raw `PATCH status='running'` with 400 + clear error message. Direct status writes to `running` would bypass the `claim_lock`/`claim_expires`/`started_at`/`worker_pid` machinery, breaking dispatcher coordination. The frontend never sends `running` (button removed + drop-target disabled); the bridge is defense-in-depth. `_set_status_direct()` helper mirrors the agent dashboard's same-named function for legitimate non-running transitions, nulling claim fields and closing active runs with `outcome='reclaimed'` when leaving `running`.
+- `blocked → ready` transitions route through `kb.unblock_task()` (fires `unblocked` event for live polling consumers), not raw UPDATE.
+- `done → archived` transitions route through `kb.archive_task()`.
+- **Archive race fix**: two-layer defense against `kb.connect(board=<slug>)` auto-materialising the directory + sqlite on first call, which would silently un-archive a board that was just removed. Frontend stops the SSE stream BEFORE the `DELETE` call (restarts on failure); bridge's `_kanban_sse_fetch_new` checks `kb.board_exists()` before `connect()`, returning empty results when the board is gone.
+- **CSS injection fix** (60874db, caught during independent security audit): `b.color` was being interpolated into a `style=""` attribute via `esc()` which HTML-escapes but doesn't prevent CSS-context injection (e.g. `color="red;background:url('http://attacker/exfil')"`). New `_kanbanSafeColor()` helper allowlists only `^#[0-9a-fA-F]{3,8}$` hex codes or `^[a-zA-Z]{3,32}$` named colors; everything else collapses to empty and the renderer drops the rule entirely.
+- **Routing-asymmetry fix** (Opus SHOULD-FIX #1): `PATCH/DELETE /api/kanban/boards/<slug>` now match the `/boards/<slug>` path BEFORE resolving `?board=`. A stray `?board=ghost` query param on a `PATCH /api/kanban/boards/experiments?board=ghost` no longer 404s on `ghost` — it correctly edits `experiments`. Mirrors the POST handler's structure.
+
+**Mobile responsive**:
+
+- 9 new rules under the existing `@media (max-width: 640px)` block covering the multi-board UI: switcher button (smaller padding/font), board-name truncation at 140px max-width, dropdown menu sized at `min(280px, 100vw - 24px)`, modal padding tightens, inline-row icon/color picker stacks vertically.
+
+**Polish**:
+
+- Accent-tinted Save button in the modal (was visually identical to Cancel before)
+- Modal + dropdown menu now use the same `linear-gradient` panel + accent border pattern as the existing `app-dialog` overlay (was using undefined `var(--panel)` falling back to transparent)
+- "Read-only view" banner now hidden by default in HTML and only shown when the bridge actually reports `read_only=true` (was permanently visible regardless of state)
+
+### Tests
+
+**4288 → 4356 passing** (+68 net).
+
+- `tests/test_kanban_bridge.py`: 18 → 41 tests (+23 covering board CRUD, slug validation, default-board protection, dispatcher routing, board isolation via `connect()` spy, SSE backlog/error-recovery/integration with worker thread + threading.Event watchdog, SSE `id:` lines, Last-Event-ID resume, PATCH/DELETE routing-order regression)
+- `tests/test_kanban_ui_static.py`: 15 → 27 tests (+12 covering switcher markup, modal markup, JS handler presence, REST verb usage, board-param plumbing, localStorage persistence, `showConfirmDialog` usage, EventSource subscription, polling fallback, panel-switch teardown, debouncing, CSS-injection regression)
+
+Total Kanban-specific test coverage: 33 → 68 tests (+35).
+
+### Pre-release verification
+
+- **Independent review (nesquena)**: APPROVED with one CSS-injection MUST-FIX caught and pushed before approval (60874db). Cross-tool checks against fresh `nousresearch/hermes-agent` tarball verified contract-for-contract parity with `plugins/kanban/dashboard/plugin_api.py` for all `/boards` endpoints + `/events` SSE wire format.
+- **Opus advisor on PR #1675 stage diff**: SHIP verdict. Two SHOULD-FIX items applied with regression tests (PATCH/DELETE routing reorder + SSE `id:` lines / Last-Event-ID resume). MUST-FIX: 0.
+- **Live end-to-end browser verification on port 8789**: Multi-board switcher, create/rename/archive flows, SSE 400ms live delivery, 5-task burst with 250ms debounce, `?board=` isolation across two boards, Last-Event-ID resume, CSS-injection fix renders safely. Zero JS errors throughout 11-step flow.
+
+### Acknowledgments
+
+This was a large stack of work. Massive thanks to **@ai-ag2026** for the full Kanban implementation across 12 commits. Reviewer security audit + CSS-injection fix by **@nesquena**. Multi-board + SSE design and integration by **@Michaelyklam** with AI-assist co-authorship.
+
 ## [v0.50.297] — 2026-05-04
 
 ### Fixed (3 PRs — closes #1658; refs #1458, #1652)
@@ -48,7 +273,6 @@
 ### Note on closed-as-superseded
 
 PR #1656 (also @Michaelyklam) was closed as superseded by #1657. Both target #1458 Bug #3, both add accept-loop heartbeat + `/health?deep=1` + 503-on-degraded. #1657 adds beyond #1656: state.db connectivity check, projects state check, FD soft-limit raise, and `docs/supervisor.md` watchdog recipe. Same author iterated; the second PR was the keeper.
-
 ## [v0.50.296] — 2026-05-04
 
 ### Fixed (3 PRs — closes #1406, #1617; refs #1362)
@@ -313,7 +537,6 @@ Two stale source-string assertions were broken by #1591's compact() and messages
 - **PR rebase verified** (REBASE-DEFAULT rule): #1586/#1590/#1591/#1592 all on current master (bf7bc6b4 = v0.50.289), zero commits behind. #1464 was 124 commits behind (forked at v0.50.275); rebased cleanly onto master.
 - **Auto-fix on #1464:** ternary inversion + regression test, with `Co-authored-by: Josh Jameson` preserved.
 - **Auto-fix on stage:** widened source-string anchors in two pre-existing brittle tests broken by #1591's structural changes.
-
 
 ## [v0.50.289] — 2026-05-03
 

@@ -50,7 +50,6 @@ function _setCompressionSessionLock(sid){
   window._compressionLockSid=sid||null;
 }
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
 /**
  * Render fenced code blocks inside user messages.
  * Extracts ```…``` fences, replaces them with placeholders,
@@ -58,6 +57,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
  * with the same <pre><code> pipeline used by renderMd().
  * All non-fenced text stays escaped (no bold/italic/link interpretation).
  */
+
 function _renderUserFencedBlocks(text){
   const stash=[];
   let s=String(text||'');
@@ -88,6 +88,169 @@ function _renderUserFencedBlocks(text){
   // Restore stashed code blocks
   s=s.replace(/\x00UF(\d+)\x00/g,(_,i)=>stash[+i]);
   return s;
+}
+function _statusCardHtml(card){
+  card=card||{};
+  const rows=Array.isArray(card.rows)?card.rows:[];
+  const sessionId=String(card.sessionId||'');
+  const shortSessionId=sessionId.length>22?`${sessionId.slice(0,10)}…${sessionId.slice(-8)}`:sessionId;
+  const copyIcon=(typeof li==='function')?li('copy',13):'Copy';
+  const copyBtn=sessionId
+    ? `<button class="status-card-session-copy" type="button" data-copy-status-session="${esc(card.sessionId||'')}" title="${esc(t('copy'))}" onclick="copyStatusSessionId(this);event.stopPropagation()"><span>${esc(shortSessionId)}</span>${copyIcon}</button>`
+    : '';
+  const rowHtml=rows.map(row=>`
+    <div class="status-card-row">
+      <span class="status-card-label">${esc(row.label||'')}</span>
+      <span class="status-card-value">${esc(row.value||'')}</span>
+    </div>`).join('');
+  return `<div class="status-card" data-status-card="1">
+    <div class="status-card-head">
+      <div class="status-card-title-wrap">
+        <div class="status-card-title">${esc(card.title||t('status_heading'))}</div>
+        <div class="status-card-subtitle">${esc(card.subtitle||'')}</div>
+      </div>
+      ${copyBtn}
+    </div>
+    <div class="status-card-grid">${rowHtml}</div>
+  </div>`;
+}
+
+const MESSAGE_RENDER_WINDOW_DEFAULT=50;
+let _messageRenderWindowSid=null;
+let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
+function _resetMessageRenderWindow(sid){
+  _messageRenderWindowSid=sid||null;
+  _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
+}
+function _currentMessageRenderWindowSize(){
+  return Math.max(
+    MESSAGE_RENDER_WINDOW_DEFAULT,
+    Number(_messageRenderWindowSize)||MESSAGE_RENDER_WINDOW_DEFAULT
+  );
+}
+function _messageRenderableMessageCount(){
+  let count=0;
+  for(const m of (S.messages||[])){
+    if(!m||!m.role||m.role==='tool') continue;
+    if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) continue;
+    const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+    const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+    if(msgContent(m)||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)))) count++;
+  }
+  return count;
+}
+function _messageHiddenBeforeCount(){
+  return Math.max(0,_messageRenderableMessageCount()-_currentMessageRenderWindowSize());
+}
+function _wireMessageWindowLoadEarlierButton(){
+  const indicator=$('loadOlderIndicator');
+  if(!indicator) return;
+  indicator.onclick=()=>{
+    if(_messageHiddenBeforeCount()>0) _showEarlierRenderedMessages();
+    else if(typeof _loadOlderMessages==='function') _loadOlderMessages();
+  };
+}
+function _showEarlierRenderedMessages(){
+  const container=$('messages');
+  const prevScrollH=container?container.scrollHeight:0;
+  const prevScrollTop=container?container.scrollTop:0;
+  _messageRenderWindowSize=_currentMessageRenderWindowSize()+MESSAGE_RENDER_WINDOW_DEFAULT;
+  renderMessages();
+  if(container){
+    const newScrollH=container.scrollHeight;
+    container.scrollTop=prevScrollTop+(newScrollH-prevScrollH);
+  }
+  _scrollPinned=false;
+}
+
+const DASHBOARD_STATUS_TTL_MS=60000;
+let _dashboardStatusCache=null;
+let _dashboardStatusFetchedAt=0;
+
+function _dashboardIsBrowserLoopback(){
+  const host=(window.location.hostname||'').replace(/^\[|\]$/g,'').toLowerCase();
+  return host==='127.0.0.1'||host==='localhost'||host==='::1';
+}
+function _dashboardBrowserUrl(status){
+  if(!status||!status.running||!status.port) return '';
+  let source;
+  try{source=new URL(status.url||('http://127.0.0.1:'+status.port));}
+  catch(_){source=new URL('http://127.0.0.1:'+status.port);}
+  const browserHost=window.location.hostname||source.hostname;
+  const displayHost=browserHost.includes(':')&&!browserHost.startsWith('[')?'['+browserHost+']':browserHost;
+  return source.protocol+'//'+displayHost+':'+status.port;
+}
+function _applyDashboardStatus(status){
+  const running=!!(status&&status.running);
+  const url=running?_dashboardBrowserUrl(status):'';
+  const warning=running&&!_dashboardIsBrowserLoopback()?t('dashboard_loopback_warning'):'';
+  document.querySelectorAll('[data-dashboard-link]').forEach(btn=>{
+    btn.classList.toggle('dashboard-link-visible',running);
+    btn.style.display=running?'':'none';
+    btn.dataset.dashboardUrl=url;
+    btn.title=warning||t('tab_dashboard');
+    btn.setAttribute('aria-label',warning||t('tab_dashboard'));
+  });
+}
+async function refreshDashboardStatus(force=false){
+  const now=Date.now();
+  if(!force&&_dashboardStatusCache&&(now-_dashboardStatusFetchedAt)<DASHBOARD_STATUS_TTL_MS){
+    _applyDashboardStatus(_dashboardStatusCache);
+    return _dashboardStatusCache;
+  }
+  try{
+    const status=await api('/api/dashboard/status');
+    _dashboardStatusCache=status||{running:false};
+  }catch(_){
+    _dashboardStatusCache={running:false};
+  }
+  _dashboardStatusFetchedAt=Date.now();
+  _applyDashboardStatus(_dashboardStatusCache);
+  return _dashboardStatusCache;
+}
+async function loadDashboardSettings(){
+  const modeEl=$('settingsDashboardMode');
+  const urlEl=$('settingsDashboardUrl');
+  if(!modeEl&&!urlEl) return;
+  try{
+    const cfg=await api('/api/dashboard/config');
+    if(modeEl) modeEl.value=cfg.enabled||'auto';
+    if(urlEl) urlEl.value=cfg.url||'';
+  }catch(_){/* leave defaults visible */}
+}
+async function saveDashboardSettings(){
+  const modeEl=$('settingsDashboardMode');
+  const urlEl=$('settingsDashboardUrl');
+  const statusEl=$('settingsDashboardStatus');
+  const payload={enabled:(modeEl&&modeEl.value)||'auto',url:(urlEl&&urlEl.value||'').trim()};
+  try{
+    const saved=await api('/api/dashboard/config',{method:'POST',body:JSON.stringify(payload)});
+    if(modeEl) modeEl.value=saved.enabled||'auto';
+    if(urlEl) urlEl.value=saved.url||'';
+    if(statusEl) statusEl.textContent='Dashboard link settings saved.';
+    await refreshDashboardStatus(true);
+  }catch(err){
+    if(statusEl) statusEl.textContent='Dashboard link settings failed to save.';
+    else if(typeof showToast==='function') showToast('Dashboard link settings failed to save.');
+  }
+}
+function openHermesDashboard(event){
+  if(event){event.preventDefault();event.stopPropagation();}
+  const btn=event&&event.currentTarget?event.currentTarget:document.querySelector('[data-dashboard-link]');
+  const url=(btn&&btn.dataset&&btn.dataset.dashboardUrl)||_dashboardBrowserUrl(_dashboardStatusCache);
+  if(!url) return false;
+  window.open(url,'_blank','noopener,noreferrer');
+  return false;
+}
+function _initDashboardLinkProbe(){
+  loadDashboardSettings();
+  refreshDashboardStatus(true);
+  setInterval(refreshDashboardStatus,DASHBOARD_STATUS_TTL_MS);
+}
+if(document.readyState==='complete'){
+  _initDashboardLinkProbe();
+}else{
+  document.addEventListener('DOMContentLoaded',_initDashboardLinkProbe,{once:true});
 }
 
 /* ── Image lightbox — click any .msg-media-img to enlarge ─────────────────── */
@@ -576,9 +739,11 @@ function syncModelChip(){
   }
   const opt=_selectedModelOption();
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
-  label.textContent=text;
-  if(mobileLabel) mobileLabel.textContent=text;
-  chip.title=sel.value||'Conversation model';
+  const gatewayRouting=_latestGatewayRoutingForSession(S.session);
+  const displayText=_formatGatewayModelLabel(sel.value||'',text,gatewayRouting)||text;
+  label.textContent=displayText;
+  if(mobileLabel) mobileLabel.textContent=displayText;
+  chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
@@ -1482,6 +1647,47 @@ function getModelLabel(modelId){
     return ollamaLabel;
   }
   return _last || 'Unknown';
+}
+
+function _gatewayProviderName(provider){
+  const text=String(provider||'').trim();
+  if(!text)return'';
+  return text.replace(/^custom:/,'').replace(/[-_]/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+}
+function _gatewayRoutingLabel(routing){
+  if(!routing)return'';
+  const provider=_gatewayProviderName(routing.used_provider||routing.provider);
+  return provider?`via ${provider}`:'';
+}
+function _formatGatewayModelLabel(modelId,labelText,routing){
+  if(!routing)return'';
+  const usedModel=String(routing.used_model||'').trim();
+  const base=usedModel?getModelLabel(usedModel):(labelText||getModelLabel(modelId));
+  const via=_gatewayRoutingLabel(routing);
+  return via?`${base} ${via}`:base;
+}
+function _gatewayRoutingFailoverText(routing){
+  if(!routing||!routing.has_failover)return'';
+  const attempts=Array.isArray(routing.routing)?routing.routing:[];
+  const providers=attempts.map(a=>_gatewayProviderName(a&&a.provider)).filter(Boolean);
+  const unique=[];providers.forEach(p=>{if(!unique.includes(p))unique.push(p);});
+  if(unique.length>=2)return`Failover: ${unique[0]} → ${unique[unique.length-1]}`;
+  const from=_gatewayProviderName(routing.requested_provider);
+  const to=_gatewayProviderName(routing.used_provider);
+  if(from&&to&&from!==to)return`Failover: ${from} → ${to}`;
+  return'Gateway failover detected';
+}
+function _gatewayModelWarningText(routing){
+  if(!routing||!routing.model_changed)return'';
+  const requested=getModelLabel(routing.requested_model||'requested model');
+  const used=getModelLabel(routing.used_model||'served model');
+  return`Model switched: ${requested} → ${used}`;
+}
+function _latestGatewayRoutingForSession(session){
+  if(!session)return null;
+  if(session.gateway_routing)return session.gateway_routing;
+  const history=Array.isArray(session.gateway_routing_history)?session.gateway_routing_history:[];
+  return history.length?history[history.length-1]:null;
 }
 
 function _stripXmlToolCallsDisplay(s){
@@ -2668,6 +2874,16 @@ function _fallbackCopy(text){
     finally{document.body.removeChild(ta);}
   });
 }
+function copyStatusSessionId(btn){
+  const text=btn&&btn.getAttribute('data-copy-status-session');
+  if(!text)return;
+  _copyText(text).then(()=>{
+    const orig=btn.innerHTML;
+    btn.innerHTML=(typeof li==='function')?li('check',13):t('copied');
+    btn.classList.add('copied');
+    setTimeout(()=>{btn.innerHTML=orig;btn.classList.remove('copied');},1500);
+  }).catch(()=>showToast(t('copy_failed')));
+}
 function copyMsg(btn){
   const row=btn.closest('[data-raw-text]');
   const text=row?row.dataset.rawText:'';
@@ -2851,6 +3067,82 @@ function dismissReconnect() {
   $('reconnectBanner').classList.remove('visible');
   clearInflight();
 }
+
+// ── Hermes agent/gateway heartbeat alert (#716) ──
+const AGENT_HEALTH_INTERVAL_MS=30000;
+const AGENT_HEALTH_DISMISSED_KEY='agent-health-dismissed';
+let _agentHealthTimer=null;
+let _agentHealthLastState='unknown';
+function _agentHealthDismissed(){
+  try{return localStorage.getItem(AGENT_HEALTH_DISMISSED_KEY)==='1';}
+  catch(_){return false;}
+}
+function _setAgentHealthDismissed(value){
+  try{
+    if(value)localStorage.setItem(AGENT_HEALTH_DISMISSED_KEY,'1');
+    else localStorage.removeItem(AGENT_HEALTH_DISMISSED_KEY);
+  }catch(_){ }
+}
+function _hideAgentHealthAlert(){
+  const banner=$('agentHealthBanner');
+  if(banner){banner.classList.remove('visible');banner.hidden=true;}
+}
+function _showAgentHealthAlert(payload){
+  if(_agentHealthDismissed()) return;
+  const banner=$('agentHealthBanner');
+  const title=$('agentHealthTitle');
+  const details=$('agentHealthDetails');
+  if(!banner) return;
+  if(title) title.textContent='Hermes agent is not responding';
+  const state=payload&&payload.details&&payload.details.gateway_state?` State: ${payload.details.gateway_state}.`:'';
+  if(details) details.textContent=`Gateway heartbeat failed.${state} Messages may not be delivered until it comes back.`;
+  banner.hidden=false;
+  banner.classList.add('visible');
+}
+function dismissAgentHealthAlert(){
+  _setAgentHealthDismissed(true);
+  _hideAgentHealthAlert();
+}
+async function pollAgentHealth(){
+  if(document.visibilityState !== 'visible') return;
+  try{
+    const payload=await api('/api/health/agent');
+    if(payload.alive === true){
+      _agentHealthLastState='alive';
+      _setAgentHealthDismissed(false);
+      _hideAgentHealthAlert();
+      return;
+    }
+    if(payload.alive === false){
+      _agentHealthLastState='down';
+      _showAgentHealthAlert(payload);
+      return;
+    }
+    if(payload.alive == null){
+      _agentHealthLastState='unknown';
+      _hideAgentHealthAlert();
+    }
+  }catch(_){
+    _agentHealthLastState='unknown';
+    _hideAgentHealthAlert();
+  }
+}
+function startAgentHealthMonitor(){
+  if(document.visibilityState !== 'visible') return;
+  if(_agentHealthTimer) return;
+  void pollAgentHealth();
+  _agentHealthTimer=setInterval(pollAgentHealth, AGENT_HEALTH_INTERVAL_MS);
+}
+function stopAgentHealthMonitor(){
+  if(_agentHealthTimer){clearInterval(_agentHealthTimer);_agentHealthTimer=null;}
+}
+function _syncAgentHealthMonitorVisibility(){
+  if(document.visibilityState === 'visible') startAgentHealthMonitor();
+  else stopAgentHealthMonitor();
+}
+document.addEventListener('visibilitychange',_syncAgentHealthMonitorVisibility);
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',startAgentHealthMonitor);
+else startAgentHealthMonitor();
 async function refreshSession() {
   // When the banner is in post-update restart mode, the "Reload" button
   // should do a full page reload — a session refresh would just 502 while
@@ -3095,7 +3387,19 @@ function syncTopbar(){
   const _topbarTitle=$('topbarTitle');if(_topbarTitle)_topbarTitle.textContent=sessionTitle;
   document.title=sessionTitle+' \u2014 '+(window._botName||'Hermes');
   const vis=S.messages.filter(m=>m&&m.role&&m.role!=='tool');
-  const _topbarMeta=$('topbarMeta');if(_topbarMeta)_topbarMeta.textContent=t('n_messages',vis.length);
+  const _topbarMeta=$('topbarMeta');
+  if(_topbarMeta){
+    const sourceLabel=(S.session&&S.session.is_cli_session&&(S.session.source_label||S.session.source_tag||S.session.raw_source))||'';
+    const metaText=t('n_messages',vis.length);
+    _topbarMeta.textContent=metaText;
+    if(sourceLabel){
+      const badge=document.createElement('span');
+      badge.className='topbar-source-badge';
+      badge.textContent=sourceLabel+(S.session.read_only?' · read-only':'');
+      _topbarMeta.appendChild(document.createTextNode(' '));
+      _topbarMeta.appendChild(badge);
+    }
+  }
   if(typeof syncAppTitlebar==='function') syncAppTitlebar();
   // If a profile switch just happened, apply its model rather than the session's stale value.
   // S._pendingProfileModel is set by switchToProfile() and cleared here after one application.
@@ -3668,6 +3972,8 @@ function renderMessages(){
   const inner=$('msgInner');
   const sid=S.session?S.session.session_id:null;
   const msgCount=S.messages.length;
+  if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);
+  const renderWindowSize=_currentMessageRenderWindowSize();
   const hasTransientTranscriptUi=!!(
     (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
     (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
@@ -3683,9 +3989,10 @@ function renderMessages(){
   // before those cards can be inserted.
   if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
     const cached=_sessionHtmlCache.get(sid);
-    if(cached&&cached.msgCount===msgCount){
+    if(cached&&cached.msgCount===msgCount&&cached.renderWindowSize===renderWindowSize){
       inner.innerHTML=cached.html;
       _sessionHtmlCacheSid=sid;
+      _wireMessageWindowLoadEarlierButton();
       if(S.activeStreamId){scrollIfPinned();}else{scrollToBottom();}
       requestAnimationFrame(()=>{highlightCode();addCopyButtons();loadDiffInline();loadCsvInline();loadExcalidrawInline();loadPdfInline();loadHtmlInline();renderMermaidBlocks();renderKatexBlocks();});
       requestAnimationFrame(()=>{highlightCode();addCopyButtons();initTreeViews();loadPdfInline();loadHtmlInline();renderMermaidBlocks();renderKatexBlocks();});
@@ -3715,19 +4022,10 @@ function renderMessages(){
       const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
       if(hasTc||hasTu||_messageHasReasoningPayload(m)) return true;
     }
-    return msgContent(m)||m.attachments?.length;
+    return m._statusCard||msgContent(m)||m.attachments?.length;
   });
   $('emptyState').style.display=(vis.length||preservedCompressionTaskMessages.length)?'none':'';
   inner.innerHTML='';
-  // Show "load older" indicator when older messages are available
-  if(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0){
-    const indicator=document.createElement('div');
-    indicator.id='loadOlderIndicator';
-    indicator.className='load-older-indicator';
-    indicator.textContent=typeof t==='function'?t('load_older_messages'):'↑ Scroll up or click to load older messages';
-    indicator.onclick=()=>{if(typeof _loadOlderMessages==='function') _loadOlderMessages();};
-    inner.appendChild(indicator);
-  }
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const referenceMessage=S.messages.find(m=>_isContextCompactionMessage(m));
   const referenceText=referenceMessage?msgContent(referenceMessage)||String(referenceMessage.content||''):'';
@@ -3743,8 +4041,32 @@ function renderMessages(){
     if(_isPreservedCompressionTaskListMessage(m)){preservedCompressionRawIdxs.push(rawIdx);rawIdx++;continue;}
     const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
     const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-    if(msgContent(m)||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)))) visWithIdx.push({m,rawIdx});
+    if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)))) visWithIdx.push({m,rawIdx});
     rawIdx++;
+  }
+  // Show a top affordance when earlier transcript content exists either in
+  // memory (DOM windowing) or on the server (paginated session fetch).
+  // Prefer expanding the local render window first so a fully loaded long
+  // session can reduce DOM nodes without losing in-memory transcript data.
+  const windowStart=Math.max(0, visWithIdx.length-renderWindowSize);
+  const hiddenBeforeCount=windowStart;
+  const renderVisWithIdx=visWithIdx.slice(windowStart);
+  const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
+  const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
+  if(hiddenBeforeCount>0 || hasServerOlder){
+    const indicator=document.createElement('button');
+    indicator.type='button';
+    indicator.id='loadOlderIndicator';
+    indicator.className='load-older-indicator message-window-load-earlier';
+    indicator.textContent=hiddenBeforeCount>0
+      ? `Load earlier messages (${hiddenBeforeCount} hidden)`
+      : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
+    indicator.onclick=()=>{
+      if(hiddenBeforeCount>0) _showEarlierRenderedMessages();
+      else if(typeof _loadOlderMessages==='function') _loadOlderMessages();
+    };
+    inner.appendChild(indicator);
+    _wireMessageWindowLoadEarlierButton();
   }
   let lastUserRawIdx=-1;
   for(let i=visWithIdx.length-1;i>=0;i--){
@@ -3754,7 +4076,7 @@ function renderMessages(){
     }
   }
   const insertionAnchor=_compressionAnchorIndex(
-    visWithIdx,
+    renderVisWithIdx,
     compressionState ? compressionState.anchorMessageKey : sessionCompressionAnchorKey,
     compressionState
       ? (typeof compressionState.anchorVisibleIdx==='number' ? compressionState.anchorVisibleIdx : compressionState.anchorRawIdx)
@@ -3765,8 +4087,10 @@ function renderMessages(){
   const assistantSegments=new Map();
   const assistantThinking=new Map();
   const userRows=new Map();
-  for(let vi=0;vi<visWithIdx.length;vi++){
-    const {m,rawIdx}=visWithIdx[vi];
+  // Windowed render loop replaces the legacy full loop:
+  // for(let vi=0;vi<visWithIdx.length;vi++)
+  for(let vi=0;vi<renderVisWithIdx.length;vi++){
+    const {m,rawIdx}=renderVisWithIdx[vi];
     const _tsSep=m._ts||m.timestamp;
     if(_tsSep){
       const _d=new Date(_tsSep*1000);
@@ -3810,7 +4134,7 @@ function renderMessages(){
       }
     }
     const isUser=m.role==='user';
-    const isLastAssistant=!isUser&&vi===visWithIdx.length-1;
+    const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
     let filesHtml='';
     if(m.attachments&&m.attachments.length){
       // Static regression tests intentionally look for msg-media-img/msg-file-badge near this branch.
@@ -3824,6 +4148,7 @@ function renderMessages(){
       }).join('')}</div>`;
     }
     const bodyHtml = isUser ? _renderUserFencedBlocks(content) : renderMd(_stripXmlToolCallsDisplay(String(content)));
+    const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
@@ -3889,8 +4214,10 @@ function renderMessages(){
       if(isSimplifiedToolCalling()) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml);
-    if(hasVisibleBody){
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml);
+    if(statusHtml){
+      seg.insertAdjacentHTML('beforeend', statusHtml);
+    }else if(hasVisibleBody){
       seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
     }else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){
       seg.classList.add('assistant-segment-anchor');
@@ -3902,8 +4229,8 @@ function renderMessages(){
   function _insertCompressionLikeNode(node, anchorIndex){
     if(!node) return;
     const anchorIdx=anchorIndex===undefined?insertionAnchor:anchorIndex;
-    if(anchorIdx!==null && visWithIdx[anchorIdx]){
-      const anchorRawIdx=visWithIdx[anchorIdx].rawIdx;
+    if(anchorIdx!==null && renderVisWithIdx[anchorIdx]){
+      const anchorRawIdx=renderVisWithIdx[anchorIdx].rawIdx;
       const anchorSeg=assistantSegments.get(anchorRawIdx);
       if(anchorSeg){
         const turn=anchorSeg.closest('.assistant-turn');
@@ -3923,13 +4250,13 @@ function renderMessages(){
   }
   function _insertCompressionLikeNodeByRawIdx(node, rawIdx){
     if(!node) return;
-    if(!visWithIdx.length){
+    if(!renderVisWithIdx.length){
       inner.appendChild(node);
       return;
     }
     let anchorIdx=null;
-    for(let i=0;i<visWithIdx.length;i++){
-      if(visWithIdx[i].rawIdx > rawIdx){
+    for(let i=0;i<renderVisWithIdx.length;i++){
+      if(renderVisWithIdx[i].rawIdx > rawIdx){
         anchorIdx=i;
         break;
       }
@@ -3938,7 +4265,7 @@ function renderMessages(){
       inner.appendChild(node);
       return;
     }
-    const anchorRawIdx=visWithIdx[anchorIdx].rawIdx;
+    const anchorRawIdx=renderVisWithIdx[anchorIdx].rawIdx;
     const anchorSeg=assistantSegments.get(anchorRawIdx);
     if(anchorSeg){
       const turn=anchorSeg.closest('.assistant-turn');
@@ -3964,16 +4291,17 @@ function renderMessages(){
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   const preservedOnlyAnchor=preservedCompressionRawIdxs.length
-    ? (()=>{let idx=null;for(let i=0;i<visWithIdx.length;i++){if(visWithIdx[i].rawIdx<preservedCompressionRawIdxs[0]) idx=i;}return idx;})()
+    ? (()=>{let idx=null;for(let i=0;i<renderVisWithIdx.length;i++){if(renderVisWithIdx[i].rawIdx<preservedCompressionRawIdxs[0]) idx=i;}return idx;})()
     : null;
   const handoffSummaryStates=_collectHandoffSummaryStates(S.messages);
 
   _insertCompressionLikeNode(compressionNode);
   _insertCompressionLikeNode(referenceNode);
   _insertCompressionLikeNode(preservedOnlyNode, preservedOnlyAnchor);
-  _insertCompressionLikeNode(handoffState?_handoffCardsNode(handoffState):null, visWithIdx.length?visWithIdx.length-1:null);
+  _insertCompressionLikeNode(handoffState?_handoffCardsNode(handoffState):null, renderVisWithIdx.length?renderVisWithIdx.length-1:null);
   for(const entry of handoffSummaryStates){
     if(!entry||!entry.state) continue;
+    if(entry.rawIdx<firstRenderedRawIdx) continue;
     _insertCompressionLikeNodeByRawIdx(_handoffCardsNode(entry.state), entry.rawIdx);
   }
   renderCompressionUi();
@@ -4067,6 +4395,7 @@ function renderMessages(){
         const cards=byAssistant[aIdx]||[];
         let anchorRow=assistantSegments.get(aIdx)||null;
         if(!anchorRow&&assistantIdxs.length){
+          if(aIdx<assistantIdxs[0]) continue;
           const fallbackIdx=[...assistantIdxs].reverse().find(idx=>idx<=aIdx);
           anchorRow=fallbackIdx!==undefined?assistantSegments.get(fallbackIdx):assistantSegments.get(assistantIdxs[assistantIdxs.length-1]);
         }
@@ -4091,6 +4420,7 @@ function renderMessages(){
         const aIdx = parseInt(key);
         let anchorRow=assistantSegments.get(aIdx)||null;
         if(!anchorRow&&assistantIdxs.length){
+          if(aIdx<assistantIdxs[0]) continue;
           const fallbackIdx=[...assistantIdxs].reverse().find(idx=>idx<=aIdx);
           anchorRow=fallbackIdx!==undefined?assistantSegments.get(fallbackIdx):assistantSegments.get(assistantIdxs[assistantIdxs.length-1]);
         }
@@ -4129,26 +4459,49 @@ function renderMessages(){
   }
   // Render per-turn duration and optional token usage on assistant messages.
   // Duration stays visible even when token usage is disabled, because it answers
-  // the basic "how long did that turn take?" UX question.
+  // the basic "how long did that turn take?" UX question. Only walk rendered
+  // assistant segments so hidden messages above the DOM window cannot skew the
+  // footer-to-message mapping.
   {
-    const asstRows=inner.querySelectorAll('.assistant-turn');
-    let ai=0; // assistant-only index for DOM rows
-    for(let mi=0;mi<S.messages.length;mi++){
-      const msg=S.messages[mi];
-      if(msg.role!=='assistant'){continue;}
+    const renderedAssistantIdxs=[...assistantSegments.keys()].sort((a,b)=>a-b);
+    for(const mi of renderedAssistantIdxs){
+      const msg=S.messages[mi]||{};
+      if(msg.role!=='assistant') continue;
+      const routing=msg._gatewayRouting||null;
+      const gatewayText=_formatGatewayModelLabel(S.session&&S.session.model||'', '', routing);
+      const failoverText=_gatewayRoutingFailoverText(routing);
+      const modelWarningText=_gatewayModelWarningText(routing);
       const hasTurnUsage=!!msg._turnUsage;
       const compactActivityForMessage=isSimplifiedToolCalling()&&(
         assistantThinking.has(mi)||
         (S.toolCalls||[]).some(tc=>tc&&(tc.assistant_msg_idx!==undefined?tc.assistant_msg_idx:-1)===mi)
       );
       const durationText=compactActivityForMessage?'':_formatTurnDuration(msg._turnDuration);
-      if(!hasTurnUsage&&!durationText){ai++;continue;}
-      if(ai>=asstRows.length) continue;
-      const row=asstRows[ai];
-      const footerRows=row.querySelectorAll('.msg-foot');
+      if(!hasTurnUsage&&!durationText&&!gatewayText&&!failoverText&&!modelWarningText) continue;
+      const seg=assistantSegments.get(mi);
+      const row=seg?seg.closest('.assistant-turn'):null;
+      const footerRows=row?row.querySelectorAll('.msg-foot'):[];
       const targetFoot=footerRows.length?footerRows[footerRows.length-1]:null;
-      if(!targetFoot||targetFoot.querySelector('.msg-usage-inline,.msg-duration-inline')){ai++;continue;}
+      if(!targetFoot||targetFoot.querySelector('.msg-usage-inline,.msg-duration-inline,.msg-gateway-inline,.gateway-failover-inline,.msg-model-warning-inline')) continue;
       const fragments=[];
+      if(modelWarningText){
+        const warning=document.createElement('span');
+        warning.className='msg-model-warning-inline';
+        warning.textContent=modelWarningText;
+        fragments.push(warning);
+      }
+      if(failoverText){
+        const failover=document.createElement('span');
+        failover.className='gateway-failover-inline';
+        failover.textContent=failoverText;
+        fragments.push(failover);
+      }
+      if(gatewayText){
+        const gateway=document.createElement('span');
+        gateway.className='msg-gateway-inline';
+        gateway.textContent=gatewayText;
+        fragments.push(gateway);
+      }
       if(durationText){
         const duration=document.createElement('span');
         duration.className='msg-duration-inline';
@@ -4170,7 +4523,6 @@ function renderMessages(){
         targetFoot.classList.add('msg-foot-with-usage');
         for(let i=fragments.length-1;i>=0;i--) targetFoot.insertBefore(fragments[i], targetFoot.firstChild);
       }
-      ai++;
     }
   }
   // Only force-scroll when not actively streaming — mid-stream re-renders
@@ -4196,7 +4548,7 @@ function renderMessages(){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){
-      _sessionHtmlCache.set(sid,{html:_html,msgCount});
+      _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowSize});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
   }
