@@ -822,7 +822,7 @@ $('modelSelect').onchange=async()=>{
     : {model:selectedModel,model_provider:null};
   if(typeof closeModelDropdown==='function') closeModelDropdown();
   if(typeof _writePersistedModelState==='function') _writePersistedModelState(modelState.model,modelState.model_provider);
-  else localStorage.setItem('hermes-webui-model', modelState.model);
+  else try{localStorage.setItem('hermes-webui-model',modelState.model)}catch{}
   await api('/api/session/update',{method:'POST',body:JSON.stringify({
     session_id:S.session.session_id,
     workspace:S.session.workspace,
@@ -982,10 +982,12 @@ $('msg').addEventListener('paste',e=>{
   const imageItems=items.filter(i=>i.kind==='file'&&i.type.startsWith('image/'));
   if(!imageItems.length||hasText)return;
   e.preventDefault();
-  const files=imageItems.map(i=>{
+  const pasteTs=Date.now();
+  const files=imageItems.map((i,idx)=>{
     const blob=i.getAsFile();
     const ext=i.type.split('/')[1]||'png';
-    return new File([blob],`screenshot-${Date.now()}.${ext}`,{type:i.type});
+    const suffix=imageItems.length>1?`-${idx+1}`:'';
+    return new File([blob],`screenshot-${pasteTs}${suffix}.${ext}`,{type:i.type});
   });
   addFiles(files);
   setStatus(t('image_pasted')+files.map(f=>f.name).join(', '));

@@ -1,5 +1,87 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.5] — 2026-05-05 — 4-PR full-sweep batch
+
+### Added
+
+- **PR #1688** by @Michaelyklam — VPS resource health Insights panel (closes #693). New `api/system_health.py` provides a dependency-free Linux/stdlib metrics collector for aggregate CPU (via /proc/stat delta sample), memory (/proc/meminfo), and root disk (shutil.disk_usage). Authenticated `GET /api/system/health` returns sanitized aggregate fields only — no process argv, env, paths, or secrets. The card lives in the Insights tab (NOT always-visible top chrome) per maintainer placement feedback. Polling is gated by `visibilityState` so hidden tabs don't poll, and on macOS/Windows the panel hides itself instead of showing a noisy error. 7 regression tests pin endpoint registration, payload sanitization, Insights placement, and absence from top chrome.
+
+### Fixed
+
+- **PR #1709** by @Michaelyklam — Preserve scroll on stream completion (closes #1690). `_run_background_title_refresh()` and terminal stream handlers were clearing `S.activeStreamId` before the final `renderMessages()` call, while `renderMessages()` chose between `scrollIfPinned()` and `scrollToBottom()` based on stream liveness alone. Result: long stream + user scrolls up to read earlier content + stream finishes → cursor jumped to bottom. Fix adds `_scrollAfterMessageRender(preserveScroll)` helper. When `preserveScroll=true`, calls `scrollIfPinned()` (respects pin state); when false (load/switch path), legacy `scrollToBottom()`. 4 callsites in messages.js terminal-stream paths (`done`, `error`, `cancel`, fallback) pass `{preserveScroll: true}`.
+- **PR #1711** by @nesquena-hermes — Hide 'Double-click to rename' tooltip on folders (closes #1710). Workspace file-tree row tooltip said "Double-click to rename" on every entry — including folders. But folder dblclick navigates via `loadDir()`, not rename; rename for folders lives in the right-click context menu. The tooltip was misleading. 4-line fix in `_renderTreeItems()`: gate `nameEl.title = t('double_click_rename')` on `item.type !== 'dir'`. Reported by @Deor in the WebUI Discord testers thread May 5 2026.
+- **PR #1712** by @24601 — Guard `localStorage.setItem('hermes-webui-model')` against `QuotaExceededError`. On setups with localStorage near quota, the bare `setItem` call threw an unhandled `DOMException` that broke model selection and prevented the chat UI from loading. Wraps both callsites (boot.js modelSelect.onchange handler, onboarding.js _saveOnboardingDefaults) in `try{...}catch{}` so the error is silently absorbed and the UI falls back to server-side model state on next load. The stored value (a model ID string) is tiny — quota failure is from overall localStorage pressure, not this key.
+
+### Tests
+
+4504 → **4527 passing** (+23 regression tests across the 4 PRs, mostly from #1688's 7-test suite). 0 regressions. Full suite ~130s.
+
+### Pre-release verification
+
+- Stage-302: 4 PRs merged with zero conflicts (each rebased clean against current master). Zero stage-applied edits to any file — every change ships exactly as the contributor wrote it.
+- All JS files syntax-clean (`node -c static/{boot,messages,onboarding,panels,ui}.js`).
+- All Python files syntax-clean (py_compile on every changed file).
+- Live browser walkthrough on port 8789:
+  - `/api/system/health` returns sanitized JSON with CPU/memory/disk percentages (no /proc paths, no argv leakage)
+  - System health card renders in Insights with Live badge + 3 progress bars (visual rated 9.5/10 via vision check)
+  - System health card NOT in top chrome (per nesquena placement feedback)
+  - Sidebar scroll holds at 400px (carry-over fix from v0.51.2 preserved)
+  - `_scrollAfterMessageRender` 4-branch behavioral test all correct (preserveScroll respects pin state in all paths)
+  - Recent-release feature inventory verified: PR #1644 model picker chip, PR #1685 Codex spark group, PR #1684 update banner network detection, PR #1671 quota card endpoint, PR #1676 heartbeat banner default-hidden, PR #1664 LLM Wiki endpoint, PR #1662 Logs nav button (via aria-label), PR #1706 paste-multiple fix
+- Opus advisor: SHIP, 6/6 verification clean, 0 MUST-FIX, 0 SHOULD-FIX. Two non-blocking observations:
+  - `/api/system/health` could use `Cache-Control: no-store` (optional, defensive)
+  - `}catch{}` in #1712 swallows all errors silently (acceptable for 2-LOC defensive guard)
+
+### Notes on this sweep
+
+- **#1686** (Docker enhance by @binhpt310) was held back. Opus advisor flagged a blocker: the PR's `docker-compose.yml` change (`build context: ..`) and `COPY hermes-agent-desktop/...` Dockerfile additions assume a sibling `hermes-agent-desktop/` directory at clone time, which would break standalone clones. Left open for follow-up.
+- **#1712** was force-pushed mid-sweep to a simpler form (drops `console.warn`). v2 adopted; fits in the original `test_provider_mismatch.py` 1100-char window so no test widening needed.
+- **#1688** was on the held list (ux + hold labels) but per maintainer call ("Looks much better, thanks! Going to move towards review and merge"), labels removed and PR included in batch. CI was already green on all 3 Python versions.
+
+Closes #693, #1690, #1710.
+
+
+## [v0.51.5] — 2026-05-05 — single-PR hotfix (#1707)
+
+### Fixed
+
+- **#1707 — single-click on workspace tree filename does nothing.** `static/ui.js` `_renderTreeItems` had `nameEl.onclick=(e)=>e.stopPropagation();` (introduced in #1702 to fix #1698 — clicking the filename was hijacking the dblclick rename handler). Pure stopPropagation swallowed the click entirely, so the row's `el.onclick=async()=>openFile(...)` never fired and clicking the filename did nothing. Fix: replace the pure-barrier with a 300ms-debounced delegator. Single-click on `nameEl` schedules a setTimeout that calls `el.onclick(e)` after the dblclick threshold passes; double-click cancels the pending timer and triggers the existing rename input. Cost: 300ms latency on file-open clicks (acceptable — matches OS dblclick threshold). Also updated `tests/test_workspace_tree_rename.py` to accept both the pre-#1707 (pure stopPropagation) and post-#1707 (debounced delegator) shapes — the original assertion was too narrow. 9 new regression tests in `tests/test_1707_workspace_filename_click.py` (6 source-level + 3 behavioral via Node VM); 7 of 9 fail on master pre-fix, all 9 pass after.
+
+## [v0.51.4] — 2026-05-05 — 10-PR full-sweep batch
+
+### Added
+
+- **PR #1685** by @Michaelyklam — Surface Codex spark models in `/api/models` (closes #1680). New `_read_visible_codex_cache_model_ids()` reads visible non-hidden slugs from `CODEX_HOME/models_cache.json`. The OpenAI Codex group now layers three sources: `hermes_cli.models.provider_model_ids("openai-codex")` first, visible cache slugs second, static `_PROVIDER_MODELS` fallback last. Users see newly available Codex models (including `gpt-5.3-codex-spark`) without waiting for WebUI catalog updates.
+- **PR #1644** by @bergeouss — Inline provider chip + group model count in composer model picker (closes #1425). Same-name models across providers are now visually distinguishable: per-row provider chip on every model option, count `(N)` next to group headings when more than one model matches, subtle border-top divider between provider groups. 13 LOC total — pattern-extension within existing dropdown.
+- **PR #1684** by @Michaelyklam — Clarify update network failures (closes #1321). Frontend detects raw fetch failures (`Failed to fetch`, `NetworkError`, `Load failed`) on `POST /api/updates/apply` and replaces the cryptic browser text with recovery-oriented guidance ("the WebUI may have restarted or the connection was interrupted; wait, reload, and check the server if needed"). Added an in-flight guard so repeated Update Now clicks don't send duplicate apply requests during restart-race windows.
+
+### Fixed
+
+- **PR #1689** by @Michaelyklam — Normalize named profile base homes (refs #749). Prevents the doubled `/base/profiles/foo/profiles/foo` path that occurred when both `HERMES_BASE_HOME=/base/profiles/foo` and the browser cookie `hermes_profile=foo` were set. New `_unwrap_profile_home_to_base()` helper normalizes either env-var path through the same base-home resolver, then routes active-profile and explicit per-request lookups through one shared profile-home resolver. Doesn't touch the broader profile UX umbrella.
+- **PR #1693** by @ai-ag2026 — Avoid adaptive title refresh session lock deadlock. `_run_background_title_refresh()` previously updated a session title while holding the global session `LOCK`, then called `Session.save()` — which itself updates the session index via `_write_session_index()` requiring the same non-reentrant `LOCK` (self-deadlock). Now the in-memory title mutation stays under `LOCK`, but `Session.save()` runs with the global lock released and only the per-session agent lock held. Plus Latin-Unicode-aware fallback title tokenization so `führe` no longer becomes `f` + `hre`.
+- **PR #1701** by @Michaelyklam — Normalize update banner repository URLs (closes #1691). The "What's new?" link previously pointed at `https://github.com/nesquena/hermes-webu/` instead of `hermes-webui`. Root cause: `.git` was treated as a character set (`[.git]`) instead of a literal suffix, and trailing slashes prevented suffix removal. New `_normalize_remote_url()` in `api/updates.py` centralizes the normalization with regression coverage on the edge case.
+- **PR #1703** by @Michaelyklam — Invalidate models cache on auth-store drift (closes #1699). When a user runs `hermes setup` in a terminal and the auth store switches the active provider outside WebUI, the in-memory + disk model caches could keep showing the previous provider's PRIMARY badge for up to the 24h TTL. New non-secret source fingerprint covers `config.yaml` and `auth.json` path/mtime/size; cache rebuilds when either changes outside WebUI. Disk cache schema bumped to reject older cache files cleanly.
+- **PR #1702** by @Michaelyklam — Fix workspace tree double-click rename (closes #1698). The right workspace panel advertised double-click rename on file names, but file-name single-click bubbled to the row's preview handler before the dblclick rename path could take over. Added a `nameEl.onclick` propagation guard before the existing `nameEl.ondblclick` handler in `static/ui.js` while leaving row/icon/whitespace clicks available for preview. Right-click context-menu rename remains as before.
+- **PR #1704** by @Michaelyklam — Honor markdown fence lengths (closes #1696). The `renderMd()` regex hard-coded triple-backtick closers, so 4/5-backtick markdown examples closed at inner triple fences. Updated fenced-code matching to capture `{3,}` backtick opener runs and require the same character + at least as many backticks on close (per CommonMark §4.5). Same fence-length rule applied to user-message fenced rendering and to the blockquote pre-pass fence-state walker. Empty-fence handling unchanged.
+- **PR #1706** by @Michaelyklam — Paste multiple images at once attaches all of them (closes #1697). `static/boot.js` paste handler called `Date.now()` inside a synchronous `.map()` callback over `imageItems`. All N synthesized `File` objects ended up with identical filenames (same millisecond), and `addFiles()` deduped by name and silently dropped images 2..N. Fix captures `pasteTs = Date.now()` once outside the map and adds deterministic `-1`, `-2`, … suffixes only when the paste contains multiple images. Single-image paste filename shape unchanged for compatibility. Functional Node-driven test extracts and executes the real paste handler.
+
+### Tests
+
+4477 → **4503 passing** (+26 regression tests across the 10 PRs). 0 regressions. Full suite ~135s.
+
+### Pre-release verification
+
+- Stage-301 build: 10 PRs merged with zero conflicts (each rebased clean against current master).
+- All JS files syntax-clean (`node -c static/boot.js && node -c static/ui.js`).
+- All Python files syntax-clean (py_compile on every changed file).
+- Live browser walkthrough on port 8789: model picker chip + group count rendering, all `/api/wiki/status`, `/api/logs`, `/api/provider/quota`, `/api/health/agent` endpoints respond 200, sidebar scroll fix preserved, `boot.js` PR #1706 fix verified live (pasteTs captured outside map, index parameter present, Date.now() removed from inside .map()).
+- Opus advisor pass on 9-PR variant (with #1705 in slot 10): SHIP, 7/7 verification questions resolved cleanly. Late swap to #1706 keeps identical fix shape (same `pasteTs` outside map + index suffix); Opus's verification answers carry over because the production diff is unchanged.
+
+### Notes on the 1705 → 1706 swap
+
+@Michaelyklam filed PR #1706 with a functional Node-driven regression test (extracts the real paste handler and asserts two pasted image items become two pending attachments) replacing my own #1705 which used static-source-string assertions. Same code fix, better test approach. Closed #1705 and absorbed #1706 into stage-301.
+
+
 ## [v0.51.3] — 2026-05-04 — 3-PR follow-up batch (#1671, #1673, #1676) + test-fragility fix
 
 ### Added
