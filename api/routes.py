@@ -934,6 +934,28 @@ def _resolve_compatible_session_model_state(
 
     # Skip normalization for models on custom/openrouter namespaces — these are
     # user-controlled and should never be silently replaced.
+    #
+    # OpenAI Codex is intentionally normalized to the OpenAI family above so bare
+    # GPT IDs survive provider switches. Slash-qualified OpenAI IDs are different:
+    # ``openai/gpt-...`` is the OpenRouter shape for OpenAI models, and
+    # resolve_model_provider() routes that through OpenRouter when Codex is the
+    # configured provider. Legacy sessions can carry that stale slash ID without
+    # a saved model_provider, so repair it to the active Codex default unless the
+    # session/request explicitly says it is an OpenRouter selection. (#1734)
+    if (
+        raw_active_provider == "openai-codex"
+        and model_provider == "openai"
+        and requested_provider is None
+        and default_model
+    ):
+        # Persist provider_context = "openai-codex" unconditionally on this
+        # repair path so the resolved shape is stable across resolutions
+        # (Opus stage-303 SHOULD-FIX: avoid redundant repair-writes per
+        # chat-start when the catalog-coverage check fails — e.g. if a
+        # future Codex default is itself slash-prefixed). Once we've
+        # decided the session belongs to Codex, persist that decision.
+        return default_model, raw_active_provider, True
+
     # Also normalize when the model is from a known provider but the active provider
     # is an unlisted one (e.g. ollama-cloud) — active_provider is "" in that case
     # but raw_active_provider is set. If model_provider doesn't start with the raw
@@ -1270,9 +1292,15 @@ def _merge_cli_sidebar_metadata(ui_session: dict, cli_meta: dict) -> dict:
     if cli_meta.get("last_message_at") is not None:
         merged["last_message_at"] = cli_meta["last_message_at"]
     if cli_meta.get("message_count") is not None:
-        merged["message_count"] = cli_meta["message_count"]
+        merged["message_count"] = max(
+            _numeric_count(merged.get("message_count")),
+            _numeric_count(cli_meta.get("message_count")),
+        )
     elif cli_meta.get("actual_message_count") is not None:
-        merged["message_count"] = cli_meta["actual_message_count"]
+        merged["message_count"] = max(
+            _numeric_count(merged.get("message_count")),
+            _numeric_count(cli_meta.get("actual_message_count")),
+        )
 
     if cli_meta.get("title"):
         current_title = merged.get("title")
@@ -2625,7 +2653,13 @@ def handle_get(handler, parsed) -> bool:
             _t3 = _time.monotonic()
             if load_messages:
                 if is_messaging_session and cli_messages:
-                    _all_msgs = cli_messages
+                    sidecar_messages = getattr(s, "messages", []) or []
+                    # Recovery/aggregate sidecars can intentionally contain a
+                    # longer visible conversation than the single state.db
+                    # segment for this messaging session id. Prefer the longer
+                    # sidecar so repaired WebUI history is not hidden behind the
+                    # canonical per-segment transcript.
+                    _all_msgs = sidecar_messages if len(sidecar_messages) > len(cli_messages) else cli_messages
                 else:
                     _all_msgs = s.messages
             else:
@@ -5934,6 +5968,27 @@ def _handle_chat_start(handler, body):
         s = get_session(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
+    requested_profile = str(body.get("profile") or "").strip()
+    if requested_profile:
+        try:
+            from api.profiles import _PROFILE_ID_RE
+
+            if requested_profile != "default" and not _PROFILE_ID_RE.fullmatch(requested_profile):
+                return bad(handler, "invalid profile", 400)
+        except ImportError:
+            requested_profile = ""
+    if requested_profile and not _profiles_match(getattr(s, "profile", None), requested_profile):
+        has_persisted_turns = bool(
+            getattr(s, "messages", None)
+            or getattr(s, "context_messages", None)
+            or getattr(s, "pending_user_message", None)
+        )
+        if not has_persisted_turns:
+            # Empty sessions are placeholders. If the user switches profiles
+            # before sending the first turn, run the placeholder under the
+            # currently-selected profile instead of the stale one stamped at
+            # creation time.
+            s.profile = requested_profile
     msg = str(body.get("message", "")).strip()
     if not msg:
         return bad(handler, "message is required")
@@ -5992,7 +6047,11 @@ def _handle_chat_start(handler, body):
         daemon=True,
     )
     thr.start()
-    response = {"stream_id": stream_id, "session_id": s.session_id}
+    response = {
+        "stream_id": stream_id,
+        "session_id": s.session_id,
+        "pending_started_at": s.pending_started_at,
+    }
     if normalized_model:
         response["effective_model"] = model
     if model_provider:
@@ -7667,6 +7726,7 @@ def _handle_session_import_cli(handler, body):
                 "raw_source": existing.raw_source or cli_meta.get("raw_source") or cli_meta.get("source_tag"),
                 "session_source": existing.session_source or cli_meta.get("session_source"),
                 "source_label": existing.source_label or cli_meta.get("source_label"),
+                "parent_session_id": existing.parent_session_id or cli_meta.get("parent_session_id"),
             }
             for attr, value in updates.items():
                 if getattr(existing, attr, None) != value:
@@ -7708,6 +7768,7 @@ def _handle_session_import_cli(handler, body):
     cli_thread_id = None
     cli_session_key = None
     cli_platform = None
+    cli_parent_session_id = None
     cli_read_only = False
     for cs in get_cli_sessions():
         if cs["session_id"] == sid:
@@ -7726,6 +7787,7 @@ def _handle_session_import_cli(handler, body):
             cli_thread_id = cs.get("thread_id")
             cli_session_key = cs.get("session_key")
             cli_platform = cs.get("platform")
+            cli_parent_session_id = cs.get("parent_session_id")
             cli_read_only = bool(cs.get("read_only"))
             break
 
@@ -7756,6 +7818,7 @@ def _handle_session_import_cli(handler, body):
             "raw_source": cli_raw_source or cli_source_tag,
             "session_source": cli_session_source,
             "source_label": cli_source_label,
+            "parent_session_id": cli_parent_session_id,
             "read_only": True,
             "messages": msgs,
             "tool_calls": [],
@@ -7770,6 +7833,7 @@ def _handle_session_import_cli(handler, body):
         profile=profile,
         created_at=created_at,
         updated_at=updated_at,
+        parent_session_id=cli_parent_session_id,
     )
     if cron_project_id:
         s.project_id = cron_project_id

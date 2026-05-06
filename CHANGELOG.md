@@ -1,5 +1,151 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.10] — 2026-05-06 — 2-PR full-sweep batch
+
+### Fixed
+
+- **PR #1741** by @Michaelyklam — Isolate in-process cron scheduler profiles (closes #1575). The existing manual `/api/crons/run` flow already enters `cron_profile_context_for_home(...)` before calling `cron.scheduler.run_job()`, but a future in-process scheduler tick path (no request TLS) would call `run_job()` directly with whatever process-global profile happened to be active. New `install_cron_scheduler_profile_isolation()` in `api/profiles.py` (called once at WebUI profile-state init) wraps `cron.scheduler.run_job()` so it resolves the job's persisted `profile` to the matching `HERMES_HOME` and enters the same `cron_profile_context_for_home(...)` before execution. Thread-local cron-context depth tracking prevents re-entry when the manual path already pinned the profile (otherwise the non-reentrant `_cron_env_lock` would deadlock). Idempotent install via `_webui_profile_isolated` sentinel. Defensive: closes a future architectural gap; no behavior change to existing manual cron path. 4 new regression tests for the wrapper and the manual-run no-reentry guard.
+- **PR #1742** by @Michaelyklam — Allow profile switching during active streams (closes #1700). The previous `switch_profile()` blocked ALL profile switches whenever any stream was active, but the WebUI route uses cookie/thread-local switching (`process_wide=False`) which doesn't actually mutate `HERMES_HOME`, module-level path caches, process `.env`, or global config. Split the guard: process-wide global mutations remain blocked during active streams (still correct), per-client cookie switches now proceed unblocked. Frontend `static/panels.js` removes the `S.busy`-based early return and treats `active_stream_id`/`pending_user_message` as in-progress, so switching away creates a fresh session for the target profile rather than retagging the running one (matches the convention used in `static/boot.js`, `static/messages.js`, `static/commands.js`). 4 new regression tests + browser QA screenshot.
+
+### In-stage absorbed fix
+
+**Opus follow-up (absorbed in-release):**
+
+- **i18n cleanup — remove orphaned `profiles_busy_switch` keys.** PR #1742 removed the only consumer of this toast (the frontend `S.busy`-based early return). 9 locale entries were left orphaned. Opus stage-304 advisor flagged this as a low-priority SHOULD-FIX; absorbed per the absorb-default policy. Locale parity tests still pass (key removed from English first).
+
+### Tests
+
+4590 → **4596 passing** (+6 regression tests across the 2 PRs). 0 regressions. Full suite ~129s.
+
+### Pre-release verification
+
+- Stage-304: 2 PRs merged with sibling-rebase against stage HEAD on `api/profiles.py` (different regions: #1741 lines 248-345, #1742 around line 596 + #1741's offset). No conflicts.
+- All JS files syntax-clean (`node -c static/{panels,i18n}.js`).
+- All Python files syntax-clean.
+- pytest: 4596 passed, 0 failed (single clean run).
+- `scripts/run-browser-tests.sh`: all 11 endpoints PASS on isolated port 8789 with stage-304 binary.
+- Pre-stamp re-fetch: both PR heads still match local rebases — no late contributor commits.
+- Opus advisor: SHIP both, 5/5 verification questions clean, 0 MUST-FIX, 1 SHOULD-FIX absorbed (orphaned i18n keys).
+
+Closes #1575, #1700.
+
+## [v0.51.9] — 2026-05-06 — 2-PR full-sweep batch
+
+### Fixed
+
+- **PR #1735** by @dso2ng — Keep saved running sessions sidebar-only on root boot (slice of #1694). When a fresh root `/` tab restored a localStorage-saved last session and that session was still running (`active_stream_id` or `pending_user_message` present), the boot path projected the running session into the active pane and the new tab looked busy with another tab's stream. New `_savedSessionShouldStaySidebarOnly()` helper does a metadata-only `/api/session?messages=0&resolve_model=0` probe; if the saved session is running, root `/` boot leaves the pane empty/idle and refreshes the sidebar instead of calling `loadSession(savedLocal)`. Explicit `/session/<sid>` URL behavior unchanged — the gate is `!urlSession && savedLocal`. Probe failure fails open (legacy projecting behavior). 4 new regression tests + 1 cross-tab static-assertion scope-fix.
+- **PR #1738** by @Michaelyklam — Repair stale OpenAI session models for Codex (closes #1734). Existing sessions with `model=openai/gpt-...` (OpenRouter shape) and no saved `model_provider` were being treated as compatible by `_resolve_compatible_session_model_state()` when the active provider was OpenAI Codex (both normalize to "openai" family), so they passed through. At runtime, `resolve_model_provider()` then interpreted that slash-qualified ID as an OpenRouter selection under Codex, producing a misleading provider-credential failure. New branch in `_resolve_compatible_session_model_state()` at `api/routes.py:937-955` repairs the legacy no-`model_provider` shape: when `raw_active_provider == "openai-codex" AND model_provider == "openai" AND requested_provider is None AND default_model`, swap the session to active Codex default and persist `model_provider="openai-codex"`. Explicit OpenRouter selections preserved by the line 838 early return + the `requested_provider is None` gate.
+
+### In-stage absorbed fixes
+
+**Opus-applied fix (absorbed in-release):**
+
+- **#1738 follow-up — persist openai-codex provider unconditionally on repair.** Opus stage-303 advisor flagged that the catalog-coverage branch produces a redundant repair-write per chat-start when the active Codex default is itself slash-prefixed (theoretical edge case — Codex defaults are bare `gpt-...` in practice). Drop the conditional `_should_attach_codex_provider_context` check and unconditionally attach `raw_active_provider` ("openai-codex") on this repair path. Once the session has been decided to belong to Codex, that decision is persisted so the same shape can't re-trigger the repair.
+
+### Tests
+
+4584 → **4590 passing** (+6 regression tests across the 2 PRs). 0 regressions. Full suite ~138s. Stably green across multiple clean runs.
+
+### Pre-release verification
+
+- Stage-303: 2 PRs merged with zero conflicts (each rebased clean onto current master).
+- All JS files syntax-clean (`node -c static/boot.js`).
+- All Python files syntax-clean.
+- pytest: 4590 passed, 0 failed (verified across multiple runs).
+- `scripts/run-browser-tests.sh`: all 11 endpoints PASS on isolated port 8789 with stage-303 binary.
+- Pre-stamp re-fetch: both PR heads still match local rebases — no late contributor commits.
+- Opus advisor: SHIP, 5/5 verification questions clean, 0 MUST-FIX, 1 SHOULD-FIX absorbed (Codex provider context unconditional persistence).
+
+Closes #1734.
+
+## [v0.51.8] — 2026-05-06 — 7-PR full-sweep batch
+
+### Added
+
+- **PR #1727** by @Michaelyklam — Link Claude Code OAuth in onboarding (closes #1362). Host-credential linking flow rather than a browser-exposed Anthropic token flow — credential discovery and linkage live entirely on the host (`~/.claude.json` / `~/.claude/.credentials.json`); the public payloads stay token-free. New `_clear_anthropic_env_values()` clears `ANTHROPIC_TOKEN`/`ANTHROPIC_API_KEY` from the active profile's `.env` and live `os.environ`, so the agent's existing `resolve_anthropic_token()` falls through to step 3 (Claude Code credentials) per its priority list. UI surfaces a Claude Code credential-link card during onboarding when host credentials are detected. 16 regression tests pin the credential-pool marker shape, the env-clearing path, the onboarding flow, and the cross-repo agent contract.
+
+### Fixed
+
+- **PR #1725** by @Michaelyklam — Simplify compact Activity row summary. The Compact Activity row's collapsed header repeated thinking state, listed individual tool names, and showed a redundant trailing count badge — all noise that defeated the purpose of the disclosure. Drop the `.tool-call-group-list` and `.tool-call-group-count` spans from the `ensureActivityGroup` template. The summary line is now intentionally terse: `Activity: N tools` plus duration. `_syncToolCallGroupSummary` simplification removes the `thinkingCount` query, the `uniqueNames` extraction, the `parts` join, and the total-count update. DESIGN.md updated to encode the new invariant.
+- **PR #1726** by @Michaelyklam — Delegate generic provider catalogs to Hermes CLI (slice of #1240 source-of-truth umbrella). The WebUI picker should not freeze ordinary providers to its static `_PROVIDER_MODELS` snapshot when Hermes CLI can return a fresher live catalog. New four-tier resolution order in `_build_available_models_uncached`: (1) explicit user `models:` allowlist (still wins — local source-of-truth), (2) `hermes_cli.models.provider_model_ids(pid)` live catalog, (3) static `_PROVIDER_MODELS` fallback, (4) auto-detected models. The prefix routing (`@<provider>:` for non-active providers) is preserved unchanged, so cross-provider routing tests continue to pin. 12 regression tests cover the four-tier ordering and the CLI-failure fallback path.
+- **PR #1728** by @starship-s — Preserve profile context when starting chats. Two distinct fixes for the same symptom (profile-switch context loss on first turn) at different layers: (a) path/mtime-aware `get_config()` reload in `api/config.py` — watches both the config path and the file's mtime, reloads when either changes, gated by `_cfg_has_in_memory_overrides()` so test-time monkeypatches and runtime in-memory mutations are preserved; (b) `api/routes.py` chat-start placeholder retag so the streaming agent always sees the active profile's resolved model string. Regression tests pin both layers + the four-tier interaction with `cfg.providers` overrides.
+- **PR #1729** by @Michaelyklam — Persist compact Activity disclosure state. UI-only persistence — `localStorage['hermes-activity-disclosure:<sid>:<turn_key>']` keyed by session id and either `assistant:<index>` (settled) or `live:<stream_id>` (in-flight). New helpers `_writeActivityDisclosureState` / `_readActivityDisclosureState` / `_copyActivityDisclosureState` for the live-to-settled handoff when a turn finishes. Switching away from a chat and coming back preserves the mode the user left it in. Sibling-collision with #1725 on the `ensureActivityGroup` template resolved in stage by keeping #1725's terse DOM (no list/count spans) AND #1729's `_toggleActivityGroup(this)` onclick wiring + `data-activity-disclosure-key` attribute.
+- **PR #1730** by @Michaelyklam — Prevent sticky sidebar hover drag state. On mouse, `pointermove` fires for plain hover as well as press-and-drag, so without a press flag a row could enter `.dragging` without ever having a `pointerdown`. Adds `_pointerActive` gate set on pointerdown / cleared on pointerup / pointercancel / pointerleave. The 50ms tail timer for tap-vs-drag detection is preserved. Defensive `el.classList.remove('dragging')` and `_clearDragTimer` clear on pointerdown handle the rare case where stale drag state survives a focus loss.
+- **PR #1732** by @Sanjays2402 (FIRST PR — welcome!) — Unpin scroll on small upward motion during streaming (closes #1731). The original hysteresis was symmetric: an upward scroll that landed inside the 250px near-bottom zone still reported `nearBottom = true`, so the counter kept incrementing and `_scrollPinned` stayed true. The next streaming token snapped users back to the bottom, which is exactly what the reporter described. Direction-aware fix: track `_lastScrollTop`, treat any explicit upward movement (decrease >2px between samples) as immediate unpin + counter reset, while downward / stationary movement falls through the original hysteresis path. The macOS WKWebView momentum protection from #1360 is preserved on the re-pin path. 9 regression tests pin direction tracking, the unpin threshold, and that #1360 hysteresis is intact.
+
+### In-stage absorbed fixes
+
+**Test-isolation bugfix (mandatory):** PR #1728's path/mtime-aware `get_config()` reload broke the common test idiom `monkeypatch.setattr(config, "cfg", {...})`. The `cfg = _cfg_cache` alias bound at import time means rebinding only changes the module attribute; `_cfg_cache` stays unchanged, so `_cfg_has_in_memory_overrides()` returned False and the path-aware reload silently overwrote any test's override. `test_issue1426_openrouter_*` and `test_issue1680_codex_spark` failed in the full suite while passing standalone — exact polluter signature. Fix: `_cfg_has_in_memory_overrides()` now ALSO returns True when `cfg is not _cfg_cache`, and `get_config()` returns `cfg` (the override) when it differs from `_cfg_cache`. 4 new regression tests in `tests/test_stage302_config_override_regression.py` pin both prongs.
+
+**Defense-in-depth (prong 2 of test-isolation-flake-recipe):** `tests/test_sprint3.py::test_skills_list` and `test_skills_list_has_required_fields` now skip on empty list rather than asserting `> 0` / `IndexError` — same pattern already in place for `test_skills_content_known`. Future profile-switch / SKILLS_DIR repointing pollutions don't break the build.
+
+**Pre-existing wall-clock flake fix (absorb-in-release):** `tests/test_issue1144_session_time_sync.py::test_relative_time_uses_server_clock` now pins `Date.now()` to a fixed instant. Without pinning, when CI ran near 08:00 UTC the projected server time crossed midnight and "5 minutes ago" silently became "1d". Same time-of-day-pin pattern as the sibling `test_session_bucket_uses_server_clock` already used.
+
+**Opus-applied fixes (absorbed in-release):**
+
+- **#1732 follow-up — `_lastScrollTop` reset on session switch.** Opus advisor flagged that `_lastScrollTop` is module-global and persists across chat switches. When the user switches sessions, the new chat's first user scroll could compare against the previous chat's scrollTop and false-trigger an unpin. New `_resetScrollDirectionTracker()` exposed on `window` from `static/ui.js`; called from `static/sessions.js` `loadSession()` after `S.session` is reassigned.
+
+### Tests
+
+4537 → **4584 passing** (+47 regression tests across the 7 PRs + in-stage fixes). 0 regressions. Full suite ~128s.
+
+### Pre-release verification
+
+- Stage-302: 7 PRs merged with one mechanical sibling-collision resolution (#1725 + #1729 on the `ensureActivityGroup` template). Resolved by keeping #1725's terse DOM AND #1729's persistence wiring.
+- All JS files syntax-clean (`node -c static/{messages,onboarding,sessions,ui}.js`).
+- All Python files syntax-clean.
+- pytest: 4584 passed, 0 failed across multiple runs (verified stably green).
+- `scripts/run-browser-tests.sh`: all 11 endpoints PASS on isolated port 8789 with stage-302 binary; 20 QA tests via webui_qa_agent.sh all PASS.
+- Opus advisor: SHIP, 5/5 verification clean, 0 MUST-FIX, 1 SHOULD-FIX absorbed (`_lastScrollTop` session-switch reset), 1 SHOULD-FIX deferred (`_clear_anthropic_env_values` env-var race window — filed as #1736 follow-up; low-impact, onboarding-time-only race).
+
+Closes #1362, #1731.
+
+## [v0.51.7] — 2026-05-05 — single-PR docs+dx (#1695)
+
+### Changed
+
+- **#1695 — better diagnostic on `AIAgent not available` (DX + docs).** When the WebUI was launched with a Python that can't import `run_agent.AIAgent`, every chat request raised a bare `ImportError("AIAgent not available -- check that hermes-agent is on sys.path")` with no information about which Python was running, where it was looking, or what to do next. @Patrick-81 reported the symptom on a symlinked install (#1695); the maintainer's response (which Patrick confirmed worked) was a three-step diagnostic flow that we've now baked into the error message itself plus a new `docs/troubleshooting.md`. The error now includes: the running Python interpreter, the `HERMES_WEBUI_AGENT_DIR` env (set vs not set), the relevant `sys.path` entries (those mentioning hermes/agent), the most-common fix (`pip install -e .` in the agent dir), and a pointer to `docs/troubleshooting.md`. Docs entry walks through `ls`/`readlink`/`pip install -e .` diagnostic steps, three common failure modes (not on sys.path, broken symlink, wrong override), and when to file a bug.
+
+### Added
+
+- **`docs/troubleshooting.md`** — new diagnostic-flow doc with one entry to start (`AIAgent not available`); structured as Symptom → Why → Diagnostic commands → Fix → When to file a bug. Linked from README's `## Docs` section. Future failure-mode entries follow the same template.
+
+## [v0.51.6] — 2026-05-05 — 5-PR full-sweep batch
+
+### Added
+
+- **PR #1719** by @Michaelyklam — Show active elapsed time in compact activity (closes #1716). Adds an in-progress elapsed counter while the agent is still working, complementing the already-shipped post-completion duration. Backend `/api/chat/start` now returns `pending_started_at` timestamp; UI uses that as the durable source of truth (instead of a browser-local timer that resets on rerender/reconnect). The compact Activity-row timer settles back to the existing post-completion duration display when the turn finishes. Cleanup timer paths attached to `setBusy(false)`, `clearLiveToolCards()`, `removeThinking()` so the counter stops on every terminal path (turn ends, session switch, error).
+
+### Fixed
+
+- **PR #1717** by @ai-ag2026 — Preserve imported session lineage visibility. Three independent fixes for the CLI/messaging session import path: (a) preserve `parent_session_id` when importing CLI/messaging sessions into WebUI sidecars (lineage was being dropped); (b) avoid shrinking sidebar `message_count` when CLI metadata has fewer messages than a repaired/aggregate sidecar (the sidebar was reverting to the shorter count); (c) prefer the longer WebUI sidecar transcript for messaging `/api/session` responses when it contains recovered visible history. 4 new regression tests cover lineage import, read-only imports, sidebar counts, and the recovered-sidecar transcript-selection path.
+- **PR #1718** by @Michaelyklam — Preserve Activity count across chat focus changes (closes #1715). Root cause: `loadSession()` restored `S.toolCalls` from the per-session `INFLIGHT` cache, then replayed those tools through `appendLiveToolCard()` BEFORE restoring `S.activeStreamId`. `appendLiveToolCard()` intentionally no-ops without `S.activeStreamId`, so the replayed tools were dropped from the compact Activity group after focus changed. Fix: restore `S.activeStreamId` BEFORE the tool replay loop. Source-level regression assertion pins the new ordering.
+- **PR #1720** by @Michaelyklam — Fix backend tool snippet cap for "Show more" (closes #1714). Frontend already had logic to preview long tool snippets at ~800 chars and reveal the rest with "Show more", but the backend was truncating persisted tool snippets to 200 chars — so the frontend threshold could never be reached. Raises the persisted snippet cap from 200 → 4000 chars (conservative; medium tool outputs can use the existing affordance, huge outputs are still bounded so session JSON doesn't balloon). Per-issue maintainer-confirmed direction.
+- **PR #1722** by @ai-ag2026 — Suppress stale preserved task lists. After context compaction or reload, the UI was re-rendering the most recent preserved compression task-list card from history even after the actual todo state had moved on (all items completed/cancelled). Stale tasks reappeared as if still pending. Fix: only treat `pending` and `in_progress` todos as "active" when deciding whether to keep the preserved task list visible. Regression test covers the stale-preserved-task-list suppression path. Handles the `latestTodos === null` fallback correctly (no fresh todo tool message found → keep showing the preserved card, original behavior).
+
+### Tests
+
+4527 → **4537 passing** (+10 regression tests across the 5 PRs). 0 regressions. Full suite ~149s.
+
+### Pre-release verification
+
+- Stage-303: 5 PRs merged with zero conflicts (each rebased clean against current master). Zero stage-applied edits.
+- All JS files syntax-clean (`node -c static/{messages,sessions,ui}.js`).
+- All Python files syntax-clean (py_compile on every changed file).
+- Live browser walkthrough on port 8789:
+  - PR #1718 ordering fix: `S.activeStreamId` is set BEFORE `appendLiveToolCard()` replay (CORRECT-ORDER verified in source).
+  - PR #1719 `pending_started_at` flows through to messages/UI; elapsed timer code present.
+  - PR #1722 todo state filter present in source.
+  - PR #1717 sidebar module helpers present.
+  - Sidebar scroll holds at 200 (carry-over fix from v0.51.2 preserved).
+  - System health card from v0.51.5 still working in Insights (CPU 15%, RAM 48.3%, disk 33.9%).
+- Opus advisor: SHIP, 6/6 verification clean, 0 MUST-FIX, 0 SHOULD-FIX. Two non-blocking observations:
+  - #1717 "longer sidecar wins" heuristic won't honor explicit CLI-side message deletions (low likelihood for messaging sessions; documented).
+  - #1719 elapsed timer is client-clock-relative; gross browser clock drift will distort live counter (cosmetic; follow-up could send server-clock anchor).
+
+Closes #1714, #1715, #1716.
+
+
 ## [v0.51.5] — 2026-05-05 — 4-PR full-sweep batch
 
 ### Added

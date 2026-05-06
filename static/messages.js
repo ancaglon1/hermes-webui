@@ -225,6 +225,7 @@ async function send(){
       session_id:activeSid,message:msgText,
       model:S.session.model||$('modelSelect').value,workspace:S.session.workspace,
       model_provider:S.session.model_provider||null,
+      profile:S.activeProfile||S.session.profile||'default',
       attachments:uploaded.length?uploaded:undefined
     })});
     if(startData.effective_model && S.session){
@@ -243,6 +244,9 @@ async function send(){
     }
     streamId=startData.stream_id;
     S.activeStreamId = streamId;
+    if(S.session&&typeof startData.pending_started_at==='number'){
+      S.session.pending_started_at=startData.pending_started_at;
+    }
     if(S.session&&S.session.session_id===activeSid){
       S.session.active_stream_id = streamId;
     }
@@ -922,6 +926,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           S.toolCalls=d.session.tool_calls.map(tc=>({...tc,done:true}));
         } else {
           S.toolCalls=S.toolCalls.map(tc=>({...tc,done:true}));
+        }
+        if(typeof _copyActivityDisclosureState==='function'&&lastAsst){
+          const assistantIdx=S.messages.indexOf(lastAsst);
+          if(assistantIdx>=0) _copyActivityDisclosureState('live:'+streamId, 'assistant:'+assistantIdx);
         }
         if(uploaded.length){
           const lastUser=[...S.messages].reverse().find(m=>m.role==='user');
