@@ -1,6 +1,8 @@
 const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',showHiddenWorkspaceFiles:false};
 const INFLIGHT={};  // keyed by session_id while request in-flight
 const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
+const MAX_UPLOAD_BYTES=20*1024*1024;
+const MAX_UPLOAD_MB=Math.round(MAX_UPLOAD_BYTES/1024/1024);
 // Tracks which session's queue to drain in setBusy(false).
 // Set to activeSid just before setBusy(false) in done/error handlers so the
 // queue drains the session that *finished*, not the one currently viewed.
@@ -68,7 +70,15 @@ function _isBacktickFenceClose(line,minLen){
  */
 
 function _stripWorkspaceDisplayPrefix(text){
-  return String(text||'').replace(/^\s*\[Workspace:[^\]]+\]\s*/,'').trim();
+  // v1 sentinel format `[Workspace::v1: <escaped path>]\n` injected since #1918.
+  // Legacy format `[Workspace: <path>]\n` may still be present in transcripts
+  // saved before the v1 migration; fall through to the legacy regex when the
+  // v1 strip didn't match. Mirrors the Python `include_legacy=True` branch in
+  // api/streaming.py:_strip_workspace_prefix(). Per Opus advisor on stage-322.
+  const value = String(text||'');
+  const stripped = value.replace(/^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*/,'');
+  if(stripped !== value) return stripped.trim();
+  return value.replace(/^\s*\[Workspace:[^\]]+\]\s*/,'').trim();
 }
 function _renderUserFencedBlocks(text){
   const stash=[];
@@ -1498,7 +1508,10 @@ let _programmaticScroll=false;
 let _nearBottomCount=0;
 let _lastScrollTop=null;
 let _lastNonMessageScrollIntentMs=0;
+let _lastMessageUpwardIntentMs=0;
+let _messageUserUnpinned=false;
 const NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS=350;
+const MESSAGE_UPWARD_INTENT_MS=450;
 function _recordNonMessageScrollIntent(e){
   const el=document.getElementById('messages');
   const target=e&&e.target;
@@ -1508,6 +1521,18 @@ function _recordNonMessageScrollIntent(e){
   // session sidebar (or another independent pane) must not be immediately fought
   // by scrollIfPinned() writing #messages.scrollTop on the next token (#1784).
   if(!el.contains(target)) _lastNonMessageScrollIntentMs=performance.now();
+  else if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY<0)){
+    // User is intentionally moving upward in the transcript. Record the real
+    // input event so later scrollTop decreases caused by layout/windowing do
+    // not masquerade as user intent and strand live streaming away from bottom.
+    _lastMessageUpwardIntentMs=performance.now();
+    _messageUserUnpinned=true;
+    _nearBottomCount=0;
+    _scrollPinned=false;
+  }
+}
+function _recentMessageUpwardIntent(){
+  return performance.now()-_lastMessageUpwardIntentMs<MESSAGE_UPWARD_INTENT_MS;
 }
 function _recentNonMessageScrollIntent(){
   return performance.now()-_lastNonMessageScrollIntentMs<NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS;
@@ -1531,10 +1556,11 @@ if (typeof window !== 'undefined') window._resetScrollDirectionTracker = _resetS
     _scrollRaf=requestAnimationFrame(()=>{
       const top=el.scrollTop;
       const nearBottom=el.scrollHeight-top-el.clientHeight<250;
-      const movedUp=_lastScrollTop!==null && top<_lastScrollTop-2;
+      // scrollToBottomBtn visibility is updated below after pin state settles.
+      const movedUp=_lastScrollTop!==null && top<_lastScrollTop-2 && _recentMessageUpwardIntent();
       _lastScrollTop=top;
-      if(movedUp){ _nearBottomCount=0; _scrollPinned=false; } // #1731
-      else { _nearBottomCount=nearBottom?_nearBottomCount+1:0; _scrollPinned=_nearBottomCount>=2; } // #1360
+      if(movedUp){ _nearBottomCount=0; _scrollPinned=false; _messageUserUnpinned=true; } // #1731
+      else { _nearBottomCount=nearBottom?_nearBottomCount+1:0; _scrollPinned=_nearBottomCount>=2; if(_scrollPinned) _messageUserUnpinned=false; } // #1360
       const btn=$('scrollToBottomBtn');
       if(btn) btn.style.display=_scrollPinned?'none':'flex';
       // Load older messages when scrolled near the top
@@ -1820,16 +1846,32 @@ document.addEventListener('DOMContentLoaded',function(){
   tooltip.addEventListener('click',function(e){e.stopPropagation();});
 });
 
+function _setMessageScrollToBottom(){
+  const el=$('messages');
+  if(!el) return;
+  _programmaticScroll=true;
+  el.scrollTop=el.scrollHeight;
+  _lastScrollTop=el.scrollTop;
+  requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+}
+function _isMessagePaneNearBottom(threshold=250){
+  const el=$('messages');
+  if(!el) return false;
+  return el.scrollHeight-el.scrollTop-el.clientHeight<=threshold;
+}
+function _shouldFollowMessagesOnDomReplace(){
+  return !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(1200));
+}
 function scrollIfPinned(){
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
   const el=$('messages');
-  if(el){_programmaticScroll=true;el.scrollTop=el.scrollHeight;setTimeout(()=>{_programmaticScroll=false;},0);}
+  if(el){_programmaticScroll=true;el.scrollTop=el.scrollHeight;_lastScrollTop=el.scrollTop;requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });}
 }
 function scrollToBottom(){
   _scrollPinned=true;
-  const el=$('messages');
-  if(el){_programmaticScroll=true;el.scrollTop=el.scrollHeight;setTimeout(()=>{_programmaticScroll=false;},0);}
+  _messageUserUnpinned=false;
+  _setMessageScrollToBottom();
   const btn=$('scrollToBottomBtn');
   if(btn) btn.style.display='none';
 }
@@ -3765,6 +3807,7 @@ function syncTopbar(){
   if(!S.session){
     document.title=window._botName||'Hermes';
     if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
+    if(typeof _syncWorkspaceHeadingState==='function') _syncWorkspaceHeadingState();
     if(typeof syncModelChip==='function') syncModelChip();
     if(typeof syncTerminalButton==='function') syncTerminalButton();
     if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
@@ -3798,6 +3841,7 @@ function syncTopbar(){
     }
   }
   if(typeof syncAppTitlebar==='function') syncAppTitlebar();
+  if(typeof _syncWorkspaceHeadingState==='function') _syncWorkspaceHeadingState();
   // If a profile switch just happened, apply its model rather than the session's stale value.
   // S._pendingProfileModel is set by switchToProfile() and cleared here after one application.
   const modelOverride=S._pendingProfileModel;
@@ -6237,16 +6281,37 @@ function bindWorkspaceHeadingActions(){
   };
   heading.onclick=goRoot;
   heading.onkeydown=(e)=>{
+    if(!(S.session&&S.session.workspace)) return;
     if(e.key==='Enter'||e.key===' '){
       e.preventDefault();
       goRoot();
     }
   };
   heading.oncontextmenu=(e)=>{
+    if(!(S.session&&S.session.workspace)) return;
     e.preventDefault();
     e.stopPropagation();
-    if(S.session&&S.session.workspace) _showWorkspaceRootContextMenu(e);
+    _showWorkspaceRootContextMenu(e);
   };
+  _syncWorkspaceHeadingState();
+}
+
+function _syncWorkspaceHeadingState(){
+  const heading=$('workspacePanelHeading');
+  if(!heading) return;
+  const enabled=!!(S.session&&S.session.workspace);
+  heading.classList.toggle('workspace-panel-heading--enabled',enabled);
+  if(enabled){
+    heading.setAttribute('role','button');
+    heading.setAttribute('tabindex','0');
+    heading.setAttribute('aria-disabled','false');
+    heading.title='Workspace root';
+  } else {
+    heading.removeAttribute('role');
+    heading.removeAttribute('tabindex');
+    heading.setAttribute('aria-disabled','true');
+    heading.title=t('no_workspace');
+  }
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',bindWorkspaceHeadingActions);
 else bindWorkspaceHeadingActions();
@@ -6738,7 +6803,22 @@ function renderTray(){ // non-media files use paperclip chip
     tray.appendChild(chip);
   });
 }
-function addFiles(files){for(const f of files){if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);}renderTray();}
+function _uploadTooLargeMessage(file){
+  const fileSizeMb=Math.ceil(((file&&file.size)||0)/1024/1024);
+  return t('upload_too_large',MAX_UPLOAD_MB,fileSizeMb);
+}
+function _showUploadTooLarge(file){
+  const message=`${t('upload_failed')}${file&&file.name?file.name:'file'} \u2014 ${_uploadTooLargeMessage(file)}`;
+  if(typeof setStatus==='function')setStatus(`\u274c ${message}`);
+  else if(typeof showToast==='function')showToast(message,5000,'error');
+}
+function addFiles(files){
+  for(const f of files){
+    if(f&&f.size>MAX_UPLOAD_BYTES){_showUploadTooLarge(f);continue;}
+    if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);
+  }
+  renderTray();
+}
 async function uploadPendingFiles(){
   if(!S.pendingFiles.length||!S.session)return[];
   const names=[];let failures=0;
@@ -6746,9 +6826,11 @@ async function uploadPendingFiles(){
   barWrap.classList.add('active');bar.style.width='0%';
   const total=S.pendingFiles.length;
   for(let i=0;i<total;i++){
-    const f=S.pendingFiles[i];const fd=new FormData();
-    fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
+    const f=S.pendingFiles[i];
     try{
+      if(f&&f.size>MAX_UPLOAD_BYTES)throw new Error(_uploadTooLargeMessage(f));
+      const fd=new FormData();
+      fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
       const isArchive=_ARCHIVE_EXTS.test(f.name);
       const url=new URL(isArchive?'api/upload/extract':'api/upload',document.baseURI||location.href).href;
       const res=await fetch(url,{method:'POST',credentials:'include',body:fd});

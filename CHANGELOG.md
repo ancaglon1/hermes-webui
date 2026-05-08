@@ -1,5 +1,169 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.27] — 2026-05-08 — 4-PR contributor batch (Release E1: workspace-prefix sentinel hardening, custom named provider API key resolution, streaming chat scroll-pin retention, Kanban detail scrollable)
+
+### Fixed (4 PRs)
+
+- **PR #1916** by @Michaelyklam — Make Kanban detail view scrollable. The app shell sets `body { overflow: hidden }`, so the Kanban main view must own vertical scrolling. Pre-fix, a selected task with a long body could push the board below the viewport with no way to reach it. Fix: add `overflow-y: auto` to `main.main.showing-kanban > #mainKanban` (one CSS property + regression test). Closes #1915.
+
+- **PR #1914** by @ai-ag2026 — Keep streaming chat pinned after final render. During streaming, bottom-pinned scroll worked, but after the `done` event late Markdown layout growth could unpin the viewport — the user would see the last token, then suddenly the chat would scroll up by hundreds of pixels as render reflowed. Fix: add explicit upward-intent gating (`MESSAGE_UPWARD_INTENT_MS=450` ms window for wheel/touch events) so passive `scrollTop` decreases from windowing/reflow no longer count as user upward intent. Pre-replacement `shouldFollowOnDone` capture in `static/messages.js` calls `scrollToBottom()` if pin or near-bottom (`<=1200px`) was true before render. `scrollIfPinned` and `scrollToBottom` now write `_lastScrollTop` and clear the programmatic flag in a rAF so the next listener pass doesn't see a synthetic upward delta.
+
+- **PR #1918** by @franksong2702 — Fix workspace prefix sentinel handling (closes #1913 follow-up filed in v0.51.25). The pre-fix strip regex `^\s*\[Workspace:[^\]]+\]\s*` was too permissive — a user prompt starting with `[Workspace: /path/to/explain]` would be silently eaten, and workspace paths containing `]` would truncate at the first `]`. Fix introduces a versioned sentinel format `[Workspace::v1: ...]` (double-colon distinguishes from natural English) AND escapes `]` in the path with `\]`. New helpers: `_workspace_context_prefix(path)`, `_escape_workspace_prefix_path(path)`, and `_strip_workspace_prefix(text, *, include_legacy=False)` with optional legacy fallback for transcript-compaction identity matching during the migration window. Closes #1913.
+
+  **Mid-stage absorbed fixes (per Opus advisor on stage-322):**
+  1. **#1918 missed second injection site at `api/routes.py:6689`** (`_handle_chat_sync`, the `POST /api/chat` synchronous handler). Without this fix, the sync chat path would still inject legacy `[Workspace: ...]` while the streaming path injected `[Workspace::v1: ...]` — producing user bubbles that visibly leak the prefix on the sync surface, and a system-prompt format string that no longer matches reality. Maintainer routed the sync injection through `_workspace_context_prefix(...)` and updated the surrounding system-prompt text to v1 form, mirroring the streaming.py block.
+  2. **#1918 backwards-compat gap in `static/ui.js:_stripWorkspaceDisplayPrefix`** — existing on-disk transcripts saved before the v1 migration still carry the legacy format. Without a JS legacy fallback, pre-upgrade sessions would render the literal `[Workspace: /tmp/proj]` prefix in user bubbles after upgrade. Maintainer added a legacy-regex fallback paralleling the Python `include_legacy=True` branch on the streaming side; updated the regression test that previously asserted the legacy regex was absent.
+
+- **PR #1814** by @hualong1009 — Custom named provider API key resolution. Adds new top-level helper `resolve_custom_provider_connection(provider_id) -> (api_key, base_url)` that resolves `custom:*` provider IDs to credentials from `config.yaml > custom_providers[]`. Supports `api_key` as literal value, `${ENV_VAR}` interpolation, or `key_env` env-var hint. Uses `get_config()` snapshot (per-profile aware). Fallback to single-entry `custom_providers` when slug doesn't match exactly. Also adds fallback in `api/streaming.py` self-heal paths so an agent rebuild after a transient failure can re-fetch credentials. **Deferral re-evaluated (per prior sweep notes):** the prior `maintainer-review` flag noted feared overlap with #1818, but #1818 already shipped (v0.51.19) with its slug-matching helpers. Re-checking against current master post-#1818: the new `resolve_custom_provider_connection()` is purely additive (no helper duplication). **Style observation (non-blocking)**: PR's local `_slugify` has slightly different normalization (`_` → `-`, collapse `--`, strip leading/trailing `-`) than master's canonical `_custom_provider_slug_from_name`. Internally self-consistent (both pid and entry name go through the same local slugify before comparison) so it works for matching, but a follow-up could unify the slug semantics. The 6-call-site fallback pattern (3 in `api/routes.py`, 3 in `api/streaming.py`) is also a candidate for a single `apply_custom_provider_fallback()` helper.
+
+### Tests
+
+4890 → **4898 collected, 4884 passing, 0 regressions** (+8 net new). Full suite ~145s on Python 3.11 (HERMES_HOME isolated). JS syntax check (`node -c`) passes on `static/messages.js` and `static/ui.js`. Browser API sanity harness (port 8789) all-green: 11 endpoints + 20 QA tests verified. Opus advisor pass: 2 BLOCKERS identified and fixed in-stage (per absorb-in-release default), then SHIP.
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4884 passed, 11 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 145.18s.
+- Browser API harness against stage-322 on port 8789: all 11 endpoints + 20 QA tests PASS.
+- `node -c` on `static/messages.js`, `static/ui.js`: clean.
+- Stage diff: 13 files, +348/-22 (pre-Opus-fix); 14 files, +382/-31 (post-Opus-fix incorporating the routes.py legacy-injection fix and ui.js legacy-fallback fix).
+- Opus advisor pass on stage-322 brief: identified 2 BLOCKERS in PR #1918 (missed `routes.py` injection site + missing JS legacy fallback). Both absorbed in-stage per absorb-in-release default. Test that asserted "legacy regex absent" updated to assert legacy regex IS present (mirrors Python `include_legacy=True` branch).
+- v0.51.26 fixes verified preserved across rebase: `_strip_workspace_prefix` (10), `on_interim_assistant` (2), `_max_iterations_cfg` (9), `if input_tokens > 0:` (1), `get_default_hermes_root` (3), `_sessionSegmentCount` (9), `_active_skills_dir` (6).
+- Pre-stamp re-fetch of all 4 PR heads: no contributor force-pushes during the Opus window.
+
+### Opus-applied fixes (absorbed in-release)
+
+**From stage-322 absorption:**
+
+1. **#1918 second injection site** — `api/routes.py:_handle_chat_sync` was injecting legacy `[Workspace: ...]` and telling the agent that's the active format. Fixed: routed through `_workspace_context_prefix(str(s.workspace))`; updated surrounding system-prompt strings to reference `[Workspace::v1: ...]` consistently.
+
+2. **#1918 JS legacy fallback** — `static/ui.js:_stripWorkspaceDisplayPrefix` was changed to v1-only regex with no legacy fallback. Fixed: added fallthrough to legacy regex when v1 strip doesn't match, mirroring the Python `include_legacy=True` branch. Updated test `test_workspace_display_prefix_helper_strips_leading_metadata_only` to assert the legacy regex IS present (was inverted to assert it was absent).
+
+## [v0.51.26] — 2026-05-08 — 5-PR follow-on contributor batch (Release D: profile-isolation hardening across cache + skills + gateway-health, context-length config-override threading, sidebar segment count UI polish)
+
+### Fixed (5 PRs + 1 absorbed test)
+
+- **PR #1901** by @Michaelyklam — Use root-level Hermes home for gateway health status. Hermes gateway runtime state (`gateway.pid`, `gateway_state.json`) is a **root-level singleton** shared across all profiles, but WebUI under a profile-scoped `HERMES_HOME` was looking inside the profile's home directory — always missing the canonical files. Fix: resolve gateway PID path through `get_default_hermes_root()` (which correctly handles the `<root>/profiles/<name>` case by walking up to the un-profiled root). Standard `~/.hermes` and Docker `/opt/data` layouts both work. Graceful degradation when bundled hermes-agent isn't available (`try/except` returns None, falls through to pre-fix `read_runtime_status()` / `get_running_pid()` calls — preserves WebUI-only installs). Closes #1878.
+
+- **PR #1906** by @dso2ng (first-time contributor) — Sidebar UI polish: show collapsed session segment count. The sidebar already collapses continuation/compression lineage rows and carries `_lineage_collapsed_count` / `_lineage_segments` metadata. Backend can also expose `_compression_segment_count` even when the full segment list isn't materialized client-side. Pre-fix the UI showed one compact row without making it clear that it represented multiple collapsed segments. Adds `_sessionSegmentCount(s)` helper picking the largest available count, `i18n` `session_meta_segments` keys for 9 locales (en/es/de/zh/zh-Hant/ru/ja/pt/ko), and a threshold-of-`>1` rendering check that suppresses single-segment cases. Empty-array case (`Math.max(0, ...[])` = 0) gracefully falls through to omitting the badge.
+
+- **PR #1903** by @Michaelyklam — Scope skills endpoints to active profile. The Skills tab was using Hermes Agent's startup-time `SKILLS_DIR`, so switching browser profiles via the `hermes_profile` cookie did not change which local skills were listed or edited. Fix: resolve `get_active_hermes_home() / "skills"` at request time across list/content/save/delete endpoints (`api/routes.py`), without mutating process-wide state. Per-request resolution is microsecond-scale (TLS attribute lookup + path concat, no filesystem I/O). Net security improvement: `_handle_skill_delete` now validates `skill_name` for `/` and `..` before `rglob`. Closes #1880.
+
+- **PR #1898** by @nesquena-hermes (production fix) **+ functional test from PR #1904** by @Michaelyklam — Same-session profile switches were silently reusing the cached `AIAgent` from the previous profile. The agent's `_cached_system_prompt` (built from `load_soul_md()` at construction time) is sourced from `HERMES_HOME` — so when a user switched personas mid-session, the second turn carried the first profile's SOUL.md and any other profile-scoped context. **Reported by @AvidFuturist in Discord** (May 8 2026): two custom personas, mid-session switch, second turn loaded the wrong identity. Fix: append `_profile_home` (already resolved at line 1958, well before the signature blob at line ~2399) to the `SESSION_AGENT_CACHE` signature blob with `or ''` fallback for empty-HERMES_HOME deployments. Profile switches now produce a different signature, force a cache miss, and rebuild the agent under the new profile's `HERMES_HOME`. **Test absorption (Co-authored-by: Michael Lam):** replaced #1898's source-string-only test with @Michaelyklam's superior **functional regression** from PR #1904 — creates two synthetic profile homes with distinct `SOUL.md` contents, runs `_run_agent_streaming()` three times on the same session (profile A, profile A, profile B), and asserts `prompts_used_for_runs == [ALPHA, ALPHA, BETA]`. Kept the source-string ordering checks (`_profile_home` resolved before signature, `or ''` fallback) since the functional test alone wouldn't catch ordering regressions. Closes #1897.
+
+- **PR #1900** by @nesquena-hermes — The two `get_model_context_length()` fallback callsites in `api/streaming.py` (one for session persistence ~L2950, one for the SSE usage payload ~L3050) were calling the resolver with **only `model + base_url`**, omitting `config_context_length`, `provider`, and `custom_providers`. When the agent's `context_compressor` reports 0 (fresh / cached / transitioning agent), context-length resolution falls all the way through to `DEFAULT_FALLBACK_CONTEXT = 256_000` even when the user has set `model.context_length: 1048576` in `config.yaml` or has a 1M model with a `custom_providers` per-model override. **For users with a context-management plugin, this cascades into a session-killing failure mode**: auto-compression triggers far too early → flood of compress requests → 429s → credential pool exhaustion → fallback also 429s → "API call failed after 3 retries". **Reported by @AvidFuturist in Discord** with deepseek-v4-flash (1M context window). Reproduced 5×. Fix: thread `config_context_length=_cfg_ctx_len` (parsed from `_cfg.get('model', {}).get('context_length')` with safe int validation), `provider=resolved_provider or ''`, and `custom_providers=_cfg_custom_providers` through both fallback callsites. The bundled hermes-agent's resolver consults these in Step 0 ("Explicit config override — user knows best") before any probing, so a user-set context_length always wins over the 256K default. Both callsites wrapped in `try/except TypeError` for back-compat with users who pin hermes-agent to a pre-kwargs version (dead-code-defensive in production deployments running the bundled agent — kept as a safety net for mismatched-version installs). Closes #1896.
+
+### Tests
+
+4872 → **4890 collected, 4879 passing, 0 regressions** (+18 net new). Full suite ~136s on Python 3.11. JS syntax check (`node -c`) passes on both modified `.js` files. Browser API sanity harness (port 8789) all-green: 11 endpoints + 20 QA tests verified. Opus advisor pass: SHIP with three release-note call-outs, none blocking.
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4879 passed, 8 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 136.03s.
+- Browser API harness against stage-321 on port 8789: all 11 checks PASS + 20 QA security/regression tests PASS.
+- `node -c` on `static/i18n.js`, `static/sessions.js`: clean.
+- Stage diff: 13 files, +1220/-32.
+- Opus advisor pass on stage-321 brief: **SHIP**. All 5 PRs verified correct with test coverage solid. Three call-outs incorporated above (#1901 helper name corrected, #1898+#1904 combo retained, #1900 legacy fallback documented).
+- v0.51.25 fixes verified preserved across rebase: `_strip_workspace_prefix` (×3), `on_interim_assistant` (×2), `_max_iterations_cfg` (×6), `if input_tokens > 0:` Opus defensive guard (×1).
+- Pre-stamp re-fetch of all 6 PR heads (incl. #1904 absorbed): no contributor force-pushes during the Opus window.
+
+### Notes for users
+
+- **#1900 mismatched-version safety net**: WebUI v0.51.26 paired with a pre-kwargs hermes-agent (one that doesn't yet support `config_context_length` / `custom_providers` kwargs on `get_model_context_length()`) will exercise the legacy 2-arg fallback. Users running the bundled agent take the new fast path and never touch the fallback.
+- **#1905 closed as superseded** — Michaelyklam filed a parallel-iteration take on #1896 with a slightly different shape (factored helper vs inline kwargs). Closed without merge per the same-author parallel-iteration pattern; #1900's review history was further along.
+
+## [v0.51.25] — 2026-05-08 — 6-PR streaming/runtime contributor batch (Release C: profile-isolated quota probes, request wedge diagnostics, max_turns config honor, per-turn usage overwrite, interim_assistant SSE wiring, workspace-prefix transcript dedup)
+
+### Fixed (6 PRs)
+
+- **PR #1873** by @franksong2702 — Subprocess-based profile isolation for quota fetches. The original #1831 attempt added per-profile locks but CI exposed that approach as unsafe — `cron_profile_context_for_home()` mutates process-global `os.environ['HERMES_HOME']` and cron module globals. Per-profile locks would let different profile homes enter concurrently and one thread could observe another profile's home. This rework spawns subprocess workers (one per profile) that run quota probes in their own process with their own env vars, communicating results back via JSON over stdout. Eliminates the env-mutation race entirely. Closes #1831. **Operational follow-up filed:** worker-pool refactor + `prctl(PR_SET_PDEATHSIG)` + `BoundedSemaphore` concurrency cap before this hits busy multi-profile installs (current synchronous-spawn-per-probe is correct but inefficient under load).
+
+- **PR #1860** by @franksong2702 — Targeted slow-request diagnostics for the two #1855 paths (`POST /api/chat/start` + `GET /api/sessions`). Adds a lightweight `RequestDiagnostics` watchdog that only starts for those two paths. If a request is still running after the configured threshold, it logs a structured warning with request id, method, path, start time, elapsed time, current stage, accumulated stage timings, and Python thread stack snapshots. Completed requests that exceed the same threshold also log their stage timings (without thread stacks). **Does NOT alter locking or request semantics** — pure observability slice. `_diag_stage()` is a no-op shim when `diag=None` (the 99% path), so per-request overhead is near-zero. Refs #1855.
+
+- **PR #1877** by @Michaelyklam — Read `agent.max_turns` config when constructing WebUI streaming `AIAgent` instances. Pass the parsed positive value as `max_iterations` when the installed agent supports it (`'max_iterations' in _agent_params` gating, same pattern as `max_tokens`/`reasoning_config`). Include the parsed budget in the per-session agent cache signature so budget changes rebuild cached agents instead of reusing stale instances. Closes #1876.
+
+- **PR #1861** by @franksong2702 — Session usage counters (`input_tokens`, `output_tokens`, `estimated_cost`) were being **accumulated** on every completed turn. Because prompt tokens represent the full current context (which already contains all prior turns), accumulation double-counts and inflates long-session usage. Fix: store the most recent turn's values rather than the cumulative sum. **Defensive in-stage absorption (per Opus advisor on stage-320):** added `> 0` / `is not None` guards before overwriting `s.input_tokens` / `s.output_tokens` / `s.estimated_cost` so a rebuilt-from-cache-miss agent (post-restart, post-LRU-eviction) doesn't zero out persisted disk totals on its next turn. Closes #1857.
+
+- **PR #1865** by @franksong2702 — Wire runtime's `interim_assistant_callback` contract through the WebUI SSE stream. Pre-fix, the runtime emitted user-visible interim assistant commentary (e.g. "I'll inspect the workspace files now.") via the callback contract on AIAgent, but WebUI's SSE stream had no event path for it and the messages were swallowed. Fix: forward the callback through to `put('interim_assistant', {'text': visible, 'already_streamed': bool})` SSE events; frontend renders them as separate-but-non-tool live segments. The `already_streamed` flag tells the renderer not to duplicate text already emitted via `token` events (Codex-style backends). Single-purpose PR after the contributor split out earlier scope creep into separate PRs (#1869 / #1870 / #1871 / #1873).
+
+- **PR #1889** by @ai-ag2026 — WebUI sends model-facing `[Workspace: ...]` prefix to user prompts; transcript compaction was treating the prefixed and unprefixed forms as different turns and creating adjacent duplicate user bubbles. Fix: strip workspace prefix during current-user identity matching so context-compaction merges don't duplicate. The visible bubble's display content gets cleaned of the prefix during compaction merge — a desirable side effect. Refs #1217. **Follow-up filed:** consider distinguishing-sentinel format (`[Workspace::v1: ...]` or nonce) so user-typed `[Workspace: ...]` text isn't silently eaten; also handle workspace paths containing `]`. Pre-existing behavior in master (`api/streaming.py:1054` already used the same regex), this PR extends the same convention.
+
+### Tests
+
+4858 → **4872 collected, 4861 passing, 0 regressions** (+14 net new). Full suite ~145s on Python 3.11. JS syntax check (`node -c`) passes on `static/messages.js`. Browser API sanity harness (port 8789) all-green: 11 endpoints verified. Opus advisor pass: SHIP with three Medium-severity follow-ups (one absorbed in-release, two filed for follow-up PRs).
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4861 passed, 8 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 145.96s.
+- Browser API harness against stage-320 on port 8789: all 11 checks PASS.
+- `node -c` on `static/messages.js`: clean.
+- Stage diff: 13 files, +1216/-196 (heavy in tests).
+- Opus advisor pass on stage-320 brief: **SHIP** with three Medium-severity concerns (one absorbed in-release: #1861 restart-zeros-totals defensive guard; two filed as follow-ups: #1873 worker-pool ops refactor, #1889 sentinel/nonce regex tightening).
+- Pre-stamp re-fetch of all 6 PR heads: no contributor force-pushes during the Opus window.
+
+### Opus-applied fixes (absorbed in-release)
+
+**From stage-320 absorption (this release):**
+- **#1861 restart-zeros-totals defensive guard.** Opus identified that the new per-turn overwrite at `api/streaming.py:2925-2927` would zero out `s.input_tokens` / `s.output_tokens` / `s.estimated_cost` on the first turn after a WebUI restart or LRU cache eviction (the rebuilt agent's `session_*` running totals start at zero and would overwrite the persisted disk values). Added `> 0` / `is not None` guards before each overwrite. Test still passes; the guard preserves PR #1861's intended fix while preventing the restart-induced regression. <10 LOC, clearly defensive.
+
+## [v0.51.24] — 2026-05-08 — 5-PR contributor batch (Release B: local-server custom-provider model preservation, oversized upload preflight, ai-gateway phantom Custom group fix, Kanban lifecycle controls, cross-container gateway liveness)
+
+### Fixed (5 PRs)
+
+- **PR #1862** by @franksong2702 — Recognize `custom:<local-server>` provider ids as local model server providers (Ollama, LM Studio, vLLM, Tabby) and preserve full slashed model ids on non-loopback hosts. Pre-fix, slashed model ids from non-loopback Ollama instances were stripped because `_is_local_server_provider()` did not unwrap `custom:` prefixes. Now: explicit set membership check across the standard local-server provider slugs (`lmstudio`, `lm-studio`, `ollama`, `llamacpp`, `llama-cpp`, `vllm`, `tabby`, `tabbyapi`, `koboldcpp`, `textgen`, `localai`). Note: renamed local-server providers (`custom:my-vllm-prod`) on non-private hostnames are still handled via the existing `_base_url_points_at_local_server()` LAN/loopback fallback; a follow-up could thread the configured `kind`/`provider` field for full coverage. Closes #1830.
+
+- **PR #1868** by @franksong2702 — Add browser-side upload size preflight check matching the server's 20 MB limit. Pre-fix, Firefox would attempt a 182 MB multipart upload and surface `NS_ERROR_NET_RESET` / `NetworkError` to the user instead of the server's clean 413 JSON. Now: `static/ui.js` checks file size before starting upload and surfaces a clear error message in the user's locale via `static/i18n.js`. Closes #1867.
+
+- **PR #1883** by @Sanjays2402 — Two cooperating bugs in `get_available_models()` produced a phantom Custom group when the active provider was ai-gateway with `custom_providers` declared in `config.yaml`. (1) `custom:*` PIDs not in `_named_custom_groups` were dropped at the wrong stage, leaving entries that should have been pre-filtered to slip through. (2) The fallback Custom group was synthesized for any leftover entries, including auto-detected ai-gateway models that weren't supposed to be in the Custom group at all. Fix scopes both checks correctly. Cross-talk between fix paths verified to be impossible (the two fixes operate on disjoint PID shapes). Closes #1881.
+
+- **PR #1886** by @franksong2702 — Three Kanban UI lifecycle improvements: (1) remove Kanban card Start and bulk Running controls (PATCH-task-to-running was unsafe — bypassed dispatcher claim flow). (2) Rename dispatcher dry-run action from "Nudge dispatcher" to "Preview dispatcher" so the UI matches what `/api/kanban/dispatch?dry_run=1` actually does. (3) Add empty-board guidance (`kanban_work_queue_hint`) framing the Kanban panel as the Hermes Agent work queue. **Mid-stage maintainer notes:** PR was based against pre-v0.51.23 master, so during stage rebase the maintainer (a) resolved the CHANGELOG.md conflict (accept master), (b) merged the Kanban i18n additions with #1863's Japanese refresh (Japanese hint translated; other locales fall back to English to match existing kanban_* fallback pattern), and (c) restored two silent reverts from #1886's stale-base diff: #1872's `static/index.html` workspace-heading change (no role=button/tabindex) and #1871's `static/panels.js:837` `_cronPreFormDetail` reference. Both restorations verified by Opus advisor against post-merge master. Co-authored-by trailer preserves Frank Song's authorship. Closes #1885.
+
+- **PR #1887** by @Sanjays2402 — Cross-container gateway liveness via state-file freshness fallback. `gateway/status.py:get_running_pid()` walks two PID-namespace-scoped checks (file lock via `fcntl.flock(LOCK_EX | LOCK_NB)` on `gateway.lock`, and `/proc/<pid>` access checks). Both fail across container boundaries — WebUI in container A can't see the gateway in container B even when both share a writable volume. Adds a state-file freshness fallback: if the canonical lock+pid checks fail but the gateway's `gateway.json` was updated within the last 120s (two cron ticks), treat the gateway as alive. **Implementation note:** parses the embedded `updated_at` ISO-8601 string from inside the JSON content (more robust against NFS lazy mtime updates than `os.path.getmtime()`). Tolerates clock skew up to 120s in the future, rejects naive timestamps, requires `gateway_state == "running"` in the file (prevents trusting cleanup-skipped crashes). Closes #1879.
+
+### Tests
+
+4830 → **4858 collected, 4847 passing, 0 regressions** (+28 net new). Full suite ~143s on Python 3.11. JS syntax check (`node -c`) passes on all 3 modified `.js` files. Browser API sanity harness (port 8789) all-green: 11 endpoints verified. Opus advisor pass: SHIP with two follow-up flags, neither blocking.
+
+### Pre-release verification
+
+- Full pytest under `HERMES_HOME` isolation: **4847 passed, 8 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 142.86s.
+- Browser API harness against stage-319 on port 8789: all 11 checks PASS.
+- `node -c` on `static/i18n.js`, `static/panels.js`, `static/ui.js`: clean.
+- Stage diff: 11 files, +849/-43.
+- Opus advisor pass on stage-319 brief: **SHIP** with one minor follow-up (#1862 narrow gap on renamed local-server provider non-private hostnames). No MUST-FIX.
+- Pre-stamp re-fetch of all 5 PR heads: no contributor force-pushes during the Opus window. Stage commits match contributor heads.
+- Mid-stage edits applied (test failures from #1886's stale-base reverts of #1871 + #1872): both fix-restorations re-applied surgically, full pytest re-run clean post-fix.
+
+## [v0.51.23] — 2026-05-08 — 7-PR contributor batch (Release A: stale-cleanup pending-turn preservation, title refresh marker persistence, Japanese i18n refresh, Kanban predicate hardening, cron edit snapshot fix, workspace heading affordance polish)
+
+### Fixed (7 PRs)
+
+- **PR #1856** by @ai-ag2026 — Materialize a pending user turn before stale stream cleanup clears runtime fields. Prior to this fix, when `_clear_stale_streams()` ran while a session had a pending user turn (assistant hadn't started responding yet), the cleanup path cleared runtime fields including the pending turn's metadata — turn lost. Fix: materialize the pending turn into the saved transcript before the cleanup, preserving timestamp + attachments. Dedup via `_materialize_pending_user_turn_before_error()` scans the last 8 messages so retries can't produce duplicate-on-disk. New regression coverage in `tests/test_issue1361_cancel_data_loss.py` exercises the stale-cleanup pending-turn path, complementing the existing stream-error coverage.
+
+- **PR #1859** by @ai-ag2026 — Persist `llm_title_generated` marker through Session load/save cycles. `_maybe_schedule_title_refresh()` only refreshes sessions where `session.llm_title_generated == True`, but that flag wasn't being included in `to_dict`/`from_dict` round-trip — so a WebUI restart silently lost it and the adaptive title refresh logic short-circuited indefinitely. Fix adds the field to the serialization round-trip. **Migration note:** sessions whose title was LLM-generated pre-fix may incur a one-time title regeneration on their next eligible turn (bounded by `still_auto` — user-titled or already-good titles are preserved). Regression coverage in `tests/test_session_save_mode.py` pins both the constructor and disk round-trip behavior.
+
+- **PR #1863** by @koshikai — Refresh the Japanese (`ja`) locale bundle for keys that drifted out of date — onboarding connection probes, MCP-tools section, session_stop_response, and several other recently-added keys. Pure i18n string substitution in `static/i18n.js`; no logic change. 108 lines added / 108 lines removed (balanced English→Japanese substitution).
+
+- **PR #1869** by @franksong2702 — Parametrize the Kanban double-404 regression test across HTTP methods (GET/POST/PATCH/DELETE) where prior coverage exercised only GET. Tests-only PR, defense-in-depth follow-up to PR #1843's double-404 guard fix. Closes #1845.
+
+- **PR #1870** by @franksong2702 — Tighten the browser predicate that detects "stale Kanban client" via 404. Pre-fix, the predicate also accepted bare `not found` 404 messages, which would misclassify future genuine 404s as stale-client. Now requires the explicit Kanban-stale-client server message string. **Backward-compat note:** old browser tabs running against pre-#1828 servers no longer get the "Hard refresh now" hint for bare-404 cases — they'll see a normal-error path instead. Acceptable since WebUI server and client ship together. Closes #1839.
+
+- **PR #1871** by @franksong2702 — Fix `saveCronForm()` to read `no_agent` from `_cronPreFormDetail` (the explicit edit source-of-truth captured at form-open) rather than `_currentCronDetail`. Two-character source change with matching regression coverage. Closes #1840.
+
+- **PR #1872** by @franksong2702 — Disable workspace heading affordance when the session has no registered workspace. Pre-fix, the heading still rendered as a button (cursor-pointer + hover state) even though click and context-menu actions couldn't do useful work. Now: `_syncWorkspaceHeadingState()` toggles class + role/tabindex/title based on `S.session.workspace`; CSS scopes hover/focus to `.workspace-panel-heading--enabled`. Subtle a11y refinement: focus indicator now uses `:focus-visible` so clicks no longer paint an outline but keyboard tabs still do. Closes #1842.
+
+### Tests
+
+4817 → **4830 collected, 4819 passing, 0 regressions** (+13 new). Full suite ~150s on Python 3.13 with `HERMES_HOME` isolated. JS syntax check (`node -c`) passes on all 3 modified `.js` files. Browser API sanity harness (port 8789) all-green: 11 endpoints verified (health, static assets, settings, session lifecycle, chat stream).
+
+### Pre-release verification
+
+- Full pytest under HERMES_HOME isolation: **4819 passed, 8 skipped, 1 xfailed, 2 xpassed, 8 subtests passed** in 150.85s.
+- Browser API harness (`run-browser-tests.sh` against stage-318 on port 8789): all 11 checks PASS.
+- `node -c` on `static/i18n.js`, `static/panels.js`, `static/ui.js`: clean.
+- Stage diff: 14 files, +251/-124 (production code 251 LOC + tests).
+- Opus advisor pass on stage-318 brief: **SHIP** with two release-note items (incorporated above as "Migration note" on #1859 and "Backward-compat note" on #1870). No MUST-FIX. One non-blocking nit on #1869 (redundant GET/else branch in parametrized test) noted for follow-up.
+- Pre-stamp re-fetch of all 7 PR heads: no contributor force-pushes during the Opus window. Stage commits match contributor heads.
+
 ## [v0.51.22] — 2026-05-07 — 3-PR batch (P0 markdown streaming hotfix + CSP source-map allowance + LaTeX delimiter rendering)
 
 ### Fixed (3 PRs)

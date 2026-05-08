@@ -1385,6 +1385,20 @@ _LOCAL_SERVER_PROVIDERS = {
 }
 
 
+def _is_local_server_provider(provider_id: str) -> bool:
+    """True when provider_id names a local model server.
+
+    Named custom providers resolve to ``custom:<slug>``. Treat those as local
+    when the bare slug is one of the known local-server provider names too.
+    """
+    provider = str(provider_id or "").strip().lower()
+    if provider in _LOCAL_SERVER_PROVIDERS:
+        return True
+    if provider.startswith("custom:"):
+        return provider.removeprefix("custom:") in _LOCAL_SERVER_PROVIDERS
+    return False
+
+
 def _base_url_points_at_local_server(base_url: str) -> bool:
     """True if base_url's host is a loopback or private IP (likely local server).
 
@@ -1561,7 +1575,7 @@ def resolve_model_provider(model_id: str) -> tuple:
             # default settings, ignoring user-tuned context length / parallel slots.
             # See #1625. Detect either by canonical provider name OR by base_url
             # pointing at a loopback/private host.
-            if (str(config_provider or "").lower() in _LOCAL_SERVER_PROVIDERS
+            if (_is_local_server_provider(config_provider)
                     or _base_url_points_at_local_server(config_base_url)):
                 return model_id, config_provider, config_base_url
             # Only strip the provider prefix when it's a known provider namespace
@@ -1580,6 +1594,102 @@ def resolve_model_provider(model_id: str) -> tuple:
             return model_id, "openrouter", None
 
     return model_id, config_provider, config_base_url
+
+
+def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, str | None]:
+    """Return (api_key, base_url) for a named ``custom:*`` provider.
+
+    Supports ``custom_providers[].api_key`` as either a literal key or
+    ``${ENV_VAR}``, and ``custom_providers[].key_env`` as an env-var hint.
+    Returns ``(None, None)`` when no named custom provider matches.
+    """
+    pid = str(provider_id or "").strip().lower()
+    if not pid.startswith("custom:"):
+        return None, None
+
+    def _slugify(value: str) -> str:
+        s = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+        while "--" in s:
+            s = s.replace("--", "-")
+        return s.strip("-")
+
+    slug = _slugify(pid.split(":", 1)[1].strip())
+    if not slug:
+        return None, None
+
+    # Read the live config snapshot to avoid stale module-level cache edge
+    # cases after profile switches or runtime config edits.
+    cfg_data = get_config()
+
+    def _resolve_key(raw_api_key, raw_key_env) -> str | None:
+        api_key = None
+        if raw_api_key is not None:
+            key_text = str(raw_api_key).strip()
+            if key_text.startswith("${") and key_text.endswith("}") and len(key_text) > 3:
+                api_key = os.getenv(key_text[2:-1], "").strip() or None
+            elif key_text:
+                api_key = key_text
+        if not api_key:
+            key_env = str(raw_key_env or "").strip()
+            if key_env:
+                api_key = os.getenv(key_env, "").strip() or None
+        return api_key
+
+    custom_providers = cfg_data.get("custom_providers", [])
+    if not isinstance(custom_providers, list):
+        custom_providers = []
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        entry_slug = _slugify(name)
+        if entry_slug != slug:
+            continue
+
+        base_url = str(entry.get("base_url") or "").strip() or None
+        api_key = _resolve_key(entry.get("api_key"), entry.get("key_env"))
+        return api_key, base_url
+
+    # If exactly one custom provider is configured, use it as a pragmatic
+    # fallback for mismatched slugs (e.g. punctuation differences).
+    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
+        entry = custom_providers[0]
+        return (
+            _resolve_key(entry.get("api_key"), entry.get("key_env")),
+            str(entry.get("base_url") or "").strip() or None,
+        )
+
+    # Fallbacks for setups that don't use custom_providers names directly.
+    providers_cfg = cfg_data.get("providers", {})
+    provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
+    provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
+
+    model_cfg = cfg_data.get("model", {})
+    model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
+
+    fallback_base = None
+    for candidate in (provider_specific, provider_custom, model_cfg):
+        if isinstance(candidate, dict):
+            _base = str(candidate.get("base_url") or "").strip()
+            if _base:
+                fallback_base = _base
+                break
+
+    fallback_key = None
+    if isinstance(provider_specific, dict):
+        fallback_key = _resolve_key(provider_specific.get("api_key"), provider_specific.get("key_env"))
+    if not fallback_key and isinstance(provider_custom, dict):
+        fallback_key = _resolve_key(provider_custom.get("api_key"), provider_custom.get("key_env"))
+    if not fallback_key and isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
+        fallback_key = _resolve_key(model_cfg.get("api_key"), model_cfg.get("key_env"))
+
+    if fallback_key or fallback_base:
+        return fallback_key, fallback_base or None
+
+    return None, None
 
 
 def model_with_provider_context(model_id: str, model_provider: str | None = None) -> str:
@@ -2933,24 +3043,31 @@ def get_available_models() -> dict:
         # 5. Build model groups
         if detected_providers:
             for pid in sorted(detected_providers):
-                if pid.startswith("custom:") and pid in _named_custom_groups:
-                    _nc_display, _nc_models = _named_custom_groups[pid]
-                    # If all named-group models were deduped (already auto-detected
-                    # from base_url /v1/models), fall back to auto-detected models
-                    # instead of silently dropping the group (issue #1619).
-                    #
-                    # Per Opus advisor on stage-295: the load-bearing fix for the
-                    # reporter's symptom is the api/routes.py:/api/models/live
-                    # broadening to handle custom:* slugs. This block is defensive
-                    # belt-and-braces — under current _named_custom_groups
-                    # population logic (atomic add+append inside the same dedup
-                    # guard at line ~2640), an empty list shouldn't reach here.
-                    # Kept for future-proofing in case the population logic
-                    # changes (e.g. supporting model-less custom_providers entries).
-                    if not _nc_models:
-                        _nc_models = auto_detected_models_by_provider.get(pid, [])
-                    if _nc_models:
-                        groups.append({"provider": _nc_display, "provider_id": pid, "models": _nc_models})
+                # Custom-provider PIDs are populated above via the
+                # _named_custom_groups branch (or skipped intentionally).
+                # They MUST NOT fall through to the auto_detected_models
+                # fallback below, otherwise the active provider's models
+                # get copied into a phantom Custom group with mismatched
+                # provider prefixes (#1881).
+                if pid.startswith("custom:"):
+                    if pid in _named_custom_groups:
+                        _nc_display, _nc_models = _named_custom_groups[pid]
+                        # If all named-group models were deduped (already auto-detected
+                        # from base_url /v1/models), fall back to auto-detected models
+                        # instead of silently dropping the group (issue #1619).
+                        #
+                        # Per Opus advisor on stage-295: the load-bearing fix for the
+                        # reporter's symptom is the api/routes.py:/api/models/live
+                        # broadening to handle custom:* slugs. This block is defensive
+                        # belt-and-braces — under current _named_custom_groups
+                        # population logic (atomic add+append inside the same dedup
+                        # guard at line ~2640), an empty list shouldn't reach here.
+                        # Kept for future-proofing in case the population logic
+                        # changes (e.g. supporting model-less custom_providers entries).
+                        if not _nc_models:
+                            _nc_models = auto_detected_models_by_provider.get(pid, [])
+                        if _nc_models:
+                            groups.append({"provider": _nc_display, "provider_id": pid, "models": _nc_models})
                     continue
                 provider_name = _PROVIDER_DISPLAY.get(pid, pid.title())
                 if pid == "openrouter":
@@ -3240,7 +3357,17 @@ def get_available_models() -> dict:
                     if detected_models:
                         models_for_group = copy.deepcopy(detected_models)
                     elif auto_detected_models:
-                        models_for_group = copy.deepcopy(auto_detected_models)
+                        # Don't fall back to the global auto_detected_models
+                        # list for the bare "custom" PID when the active
+                        # provider is something concrete (e.g. ai-gateway,
+                        # openrouter). Those auto-detected entries already
+                        # belong to the active provider's group — copying
+                        # them into a Custom group too produces phantom
+                        # duplicates with mismatched prefixes (#1881).
+                        if pid == "custom" and active_provider and active_provider != "custom":
+                            models_for_group = []
+                        else:
+                            models_for_group = copy.deepcopy(auto_detected_models)
                     else:
                         models_for_group = []
                     if models_for_group:

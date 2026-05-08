@@ -26,6 +26,7 @@ from api.config import (
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
+    resolve_custom_provider_connection,
     model_with_provider_context,
 )
 from api.helpers import redact_session_data, _redact_text
@@ -586,6 +587,27 @@ def _message_text(value) -> str:
     return _strip_thinking_markup(str(value or '').strip())
 
 
+_WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
+_LEGACY_WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace:[^\]]+\]\s*')
+
+
+def _escape_workspace_prefix_path(path: str) -> str:
+    return str(path or '').replace('\\', '\\\\').replace(']', '\\]')
+
+
+def _workspace_context_prefix(path: str) -> str:
+    return f"[Workspace::v1: {_escape_workspace_prefix_path(path)}]\n"
+
+
+def _strip_workspace_prefix(text: str, *, include_legacy: bool = False) -> str:
+    """Remove WebUI-injected workspace tags without eating user-typed text."""
+    value = str(text or '')
+    stripped = _WORKSPACE_PREFIX_RE.sub('', value, count=1)
+    if include_legacy and stripped == value:
+        stripped = _LEGACY_WORKSPACE_PREFIX_RE.sub('', value, count=1)
+    return stripped.strip()
+
+
 def _first_exchange_snippets(messages):
     """Return (first_user_text, first_assistant_text) snippets for title generation.
 
@@ -1046,7 +1068,7 @@ def _fallback_title_from_exchange(user_text: str, assistant_text: str) -> Option
     assistant_text = _strip_thinking_markup(assistant_text or '').strip()
     if not user_text:
         return None
-    user_text = re.sub(r'^\[Workspace:[^\]]+\]\s*', '', user_text)
+    user_text = _strip_workspace_prefix(user_text)
     user_text = re.sub(r'\s+', ' ', user_text).strip()
     assistant_text = re.sub(r'\s+', ' ', assistant_text).strip()
     combined = f"{user_text} {assistant_text}".strip().lower()
@@ -1433,6 +1455,12 @@ def _message_identity(msg):
     role = str(msg.get('role') or '')
     content = msg.get('content', '')
     text = _message_text(content)
+    if role == 'user':
+        # WebUI sends the model a workspace-prefixed user_message while the
+        # visible optimistic bubble contains only the human text. Treat them as
+        # the same turn for merge/dedup purposes; otherwise compaction results
+        # render two adjacent user bubbles ("Ok" and "[Workspace...]\nOk").
+        text = _strip_workspace_prefix(text, include_legacy=True)
     if not text and not msg.get('tool_call_id') and not msg.get('tool_calls'):
         return None
     return (
@@ -1471,7 +1499,12 @@ def _find_current_user_turn(messages, msg_text):
         if not isinstance(msg, dict) or msg.get('role') != 'user':
             continue
         fallback = idx
-        text = " ".join(_message_text(msg.get('content', '')).split())
+        text = " ".join(
+            _strip_workspace_prefix(
+                _message_text(msg.get('content', '')),
+                include_legacy=True,
+            ).split()
+        )
         if needle and (needle in text or text in needle):
             return idx
     return fallback
@@ -1558,7 +1591,11 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             continue
         if _is_context_compression_marker(msg) and key is not None and key in seen:
             continue
-        merged.append(copy.deepcopy(msg))
+        display_msg = msg
+        if key is not None and key == current_user_key and isinstance(msg, dict) and msg.get('role') == 'user':
+            display_msg = copy.deepcopy(msg)
+            display_msg['content'] = msg_text
+        merged.append(copy.deepcopy(display_msg))
         if key is not None:
             seen.add(key)
     return merged
@@ -2102,6 +2139,17 @@ def _run_agent_streaming(
                 meter().record_reasoning(stream_id, _metering_reasoning_deltas[0])
                 _emit_metering()
 
+            def on_interim_assistant(text, **cb_kwargs):
+                if text is None:
+                    return
+                visible = str(text).strip()
+                if not visible:
+                    return
+                put('interim_assistant', {
+                    'text': visible,
+                    'already_streamed': bool(cb_kwargs.get('already_streamed', False)),
+                })
+
             # Pre-initialise the activity counter here so on_tool (which
             # closes over it) never captures an unbound name even if this
             # block is reordered later (Issue #765).
@@ -2240,6 +2288,16 @@ def _run_agent_streaming(
             except Exception as _e:
                 print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
+            # Named custom providers (custom:slug) may not be resolvable by
+            # hermes_cli.runtime_provider directly. Fall back to config.yaml
+            # custom_providers[] so WebUI can pass explicit creds/base_url.
+            if isinstance(resolved_provider, str) and resolved_provider.startswith("custom:"):
+                _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+                if not resolved_api_key and _cp_key:
+                    resolved_api_key = _cp_key
+                if not resolved_base_url and _cp_base:
+                    resolved_base_url = _cp_base
+
             # Read per-profile config at call time (not module-level snapshot)
             from api.config import get_config as _get_config
             _cfg = _get_config()
@@ -2295,6 +2353,29 @@ def _run_agent_streaming(
             # argument 'credential_pool' — issue #772)
             import inspect as _inspect
             _agent_params = set(_inspect.signature(_AIAgent.__init__).parameters)
+
+            # CLI-parity max-iteration budget: read config.yaml's
+            # agent.max_turns and pass it to AIAgent when supported. Without
+            # this WebUI-created agents silently use AIAgent's constructor
+            # default (90), so long browser-originated tasks hit the
+            # "maximum number of tool-calling iterations" summary path even
+            # after the operator raises Hermes' global turn budget.
+            _max_iterations_cfg = None
+            try:
+                _raw_max_iterations = None
+                _agent_cfg_for_iterations = _cfg.get('agent', {}) if isinstance(_cfg, dict) else {}
+                if isinstance(_agent_cfg_for_iterations, dict):
+                    _raw_max_iterations = _agent_cfg_for_iterations.get('max_turns')
+                if _raw_max_iterations is None and isinstance(_cfg, dict):
+                    # Back-compat for older Hermes config files that used a
+                    # root-level max_turns key.
+                    _raw_max_iterations = _cfg.get('max_turns')
+                if _raw_max_iterations is not None:
+                    _parsed_max_iterations = int(_raw_max_iterations)
+                    if _parsed_max_iterations > 0:
+                        _max_iterations_cfg = _parsed_max_iterations
+            except Exception:
+                _max_iterations_cfg = None
 
             # CLI-parity max output cap: read config.yaml's max_tokens and pass
             # it to AIAgent when supported. Without this WebUI-created agents use
@@ -2353,8 +2434,12 @@ def _run_agent_streaming(
             # but guard defensively to avoid TypeError on an older agent build.
             if 'reasoning_config' in _agent_params and _reasoning_config is not None:
                 _agent_kwargs['reasoning_config'] = _reasoning_config
+            if 'interim_assistant_callback' in _agent_params:
+                _agent_kwargs['interim_assistant_callback'] = on_interim_assistant
             if 'status_callback' in _agent_params:
                 _agent_kwargs['status_callback'] = _agent_status_callback
+            if 'max_iterations' in _agent_params and _max_iterations_cfg is not None:
+                _agent_kwargs['max_iterations'] = _max_iterations_cfg
             if 'max_tokens' in _agent_params and _max_tokens_cfg is not None:
                 _agent_kwargs['max_tokens'] = _max_tokens_cfg
             # Params added in newer hermes-agent — skip if not supported
@@ -2388,10 +2473,18 @@ def _run_agent_streaming(
                     _hashlib.sha256((resolved_api_key or '').encode()).hexdigest()[:16],
                     resolved_base_url or '',
                     resolved_provider or '',
+                    _max_iterations_cfg or '',
                     _max_tokens_cfg or '',
                     _fallback_resolved or {},
                     sorted(_toolsets) if _toolsets else [],
                     _reasoning_config or {},
+                    # #1897: profile_home is part of the agent's identity because
+                    # AIAgent caches `_cached_system_prompt` from `load_soul_md()`
+                    # at construction time, sourced from HERMES_HOME. Same-session
+                    # profile switches keep `session_id` stable, so without this
+                    # field the cached agent silently retains the previous
+                    # profile's SOUL.md (and any other profile-scoped context).
+                    _profile_home or '',
                 ], sort_keys=True)
                 _agent_sig = _hashlib.sha256(_sig_blob.encode()).hexdigest()[:16]
 
@@ -2410,6 +2503,8 @@ def _run_agent_streaming(
                     agent.tool_progress_callback = _agent_kwargs.get('tool_progress_callback')
                     if hasattr(agent, 'status_callback'):
                         agent.status_callback = _agent_kwargs.get('status_callback')
+                    if hasattr(agent, 'interim_assistant_callback'):
+                        agent.interim_assistant_callback = _agent_kwargs.get('interim_assistant_callback')
                     if hasattr(agent, 'reasoning_callback'):
                         agent.reasoning_callback = _agent_kwargs.get('reasoning_callback')
                     if hasattr(agent, 'clarify_callback'):
@@ -2471,15 +2566,15 @@ def _run_agent_streaming(
 
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
-            workspace_ctx = f"[Workspace: {s.workspace}]\n"
+            workspace_ctx = _workspace_context_prefix(str(s.workspace))
             workspace_system_msg = (
                 f"Active workspace at session start: {s.workspace}\n"
-                "Every user message is prefixed with [Workspace: /absolute/path] indicating the "
+                "Every user message is prefixed with [Workspace::v1: /absolute/path] indicating the "
                 "workspace the user has selected in the web UI at the time they sent that message. "
                 "This tag is the single authoritative source of the active workspace and updates "
                 "with every message. It overrides any prior workspace mentioned in this system "
                 "prompt, memory, or conversation history. Always use the value from the most recent "
-                "[Workspace: ...] tag as your default working directory for ALL file operations: "
+                "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
                 "write_file, read_file, search_files, terminal workdir, and patch. "
                 "Never fall back to a hardcoded path when this tag is present."
             )
@@ -2662,6 +2757,12 @@ def _run_agent_streaming(
                                 resolved_provider = _heal_rt.get('provider')
                             if not resolved_base_url:
                                 resolved_base_url = _heal_rt.get('base_url')
+                            if isinstance(resolved_provider, str) and resolved_provider.startswith('custom:'):
+                                _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+                                if not resolved_api_key and _cp_key:
+                                    resolved_api_key = _cp_key
+                                if not resolved_base_url and _cp_base:
+                                    resolved_base_url = _cp_base
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
                             _agent_kwargs['base_url'] = resolved_base_url
@@ -2862,14 +2963,24 @@ def _run_agent_streaming(
                 _a0 = ''
                 if _should_bg_title:
                     _u0, _a0 = _first_exchange_snippets(s.messages)
-                # Read token/cost usage from the agent object (if available)
+                # Read token/cost usage from the agent object (if available).
+                # Per-turn overwrite (#1857): replace cumulative session totals with the
+                # agent's most recent values, which already represent the current turn's
+                # full prompt+completion (input_tokens are the entire context, not delta).
+                # Defensive: only overwrite when the agent reports non-zero / non-None
+                # values. A rebuilt-from-cache-miss agent (post-restart, post-LRU-eviction)
+                # starts at zero; without this guard, the next turn would zero out the
+                # persisted disk total before any new tokens were spent. Per Opus advisor
+                # on stage-320: prevents restart-induced regression of session usage data.
                 input_tokens = getattr(agent, 'session_prompt_tokens', 0) or 0
                 output_tokens = getattr(agent, 'session_completion_tokens', 0) or 0
                 estimated_cost = getattr(agent, 'session_estimated_cost_usd', None)
-                s.input_tokens = (s.input_tokens or 0) + input_tokens
-                s.output_tokens = (s.output_tokens or 0) + output_tokens
-                if estimated_cost:
-                    s.estimated_cost = (s.estimated_cost or 0) + estimated_cost
+                if input_tokens > 0:
+                    s.input_tokens = input_tokens
+                if output_tokens > 0:
+                    s.output_tokens = output_tokens
+                if estimated_cost is not None:
+                    s.estimated_cost = estimated_cost
                 # Persist tool-call summaries even when the final message history only
                 # kept bare tool rows and omitted explicit assistant tool_call IDs.
                 tool_calls = _extract_tool_calls_from_messages(
@@ -2947,15 +3058,62 @@ def _run_agent_streaming(
                 # the indicator can still show a meaningful percentage.
                 # Sourced from PR #1344 (@jasonjcwu) — extracted to a focused
                 # follow-up after PR #1344 was closed as superseded by #1341.
+                #
+                # #1896: pass config_context_length, provider, and
+                # custom_providers so explicit config overrides win over the
+                # 256K default fallback. Without these, users on 1M-context
+                # models who set `model.context_length: 1048576` (or rely on
+                # a `custom_providers` per-model override) get a 256K
+                # window in the persisted session and the SSE payload —
+                # which then trips LCM auto-compress at ~25% of the wrong
+                # value, cascading into 429 floods.
                 if not getattr(s, 'context_length', 0):
                     try:
                         from agent.model_metadata import get_model_context_length
+                        _cfg_ctx_len = None
+                        _cfg_custom_providers = None
+                        try:
+                            _model_cfg_for_ctx = _cfg.get('model', {}) if isinstance(_cfg, dict) else {}
+                            if isinstance(_model_cfg_for_ctx, dict):
+                                _raw_cfg_ctx = _model_cfg_for_ctx.get('context_length')
+                                if _raw_cfg_ctx is not None:
+                                    try:
+                                        _parsed_cfg_ctx = int(_raw_cfg_ctx)
+                                        if _parsed_cfg_ctx > 0:
+                                            _cfg_ctx_len = _parsed_cfg_ctx
+                                    except (TypeError, ValueError):
+                                        # Invalid config — let the resolver fall
+                                        # through to provider/registry probing.
+                                        pass
+                            _raw_cp = _cfg.get('custom_providers') if isinstance(_cfg, dict) else None
+                            if isinstance(_raw_cp, list):
+                                _cfg_custom_providers = _raw_cp
+                        except Exception:
+                            pass
                         _resolved_cl = get_model_context_length(
                             getattr(agent, 'model', resolved_model or '') or '',
                             getattr(agent, 'base_url', '') or '',
+                            config_context_length=_cfg_ctx_len,
+                            provider=resolved_provider or '',
+                            custom_providers=_cfg_custom_providers,
                         )
                         if _resolved_cl:
                             s.context_length = _resolved_cl
+                    except TypeError:
+                        # Older hermes-agent builds whose get_model_context_length
+                        # signature pre-dates the config_context_length /
+                        # custom_providers kwargs. Retry with the legacy 2-arg
+                        # form so the indicator still resolves *something*.
+                        try:
+                            from agent.model_metadata import get_model_context_length as _legacy_cl
+                            _resolved_cl = _legacy_cl(
+                                getattr(agent, 'model', resolved_model or '') or '',
+                                getattr(agent, 'base_url', '') or '',
+                            )
+                            if _resolved_cl:
+                                s.context_length = _resolved_cl
+                        except Exception:
+                            pass
                     except Exception:
                         # Older hermes-agent builds may not expose this helper.
                         # Better to leave context_length=0 than crash the save.
@@ -2999,13 +3157,47 @@ def _run_agent_streaming(
             # resolve the model's context window from metadata so the UI indicator
             # shows the correct percentage rather than overflowing against the 128K
             # JS default.  Mirrors the session-save fallback above (lines ~2205-2217).
+            #
+            # #1896: pass config_context_length, provider, and custom_providers so
+            # explicit config overrides win over the 256K default fallback. The
+            # SSE payload's `context_length` is what feeds the live token-usage
+            # indicator, so a stale 256K here surfaces as the same wrong-window
+            # display that motivates this fix.
             if not usage.get('context_length'):
                 try:
                     from agent.model_metadata import get_model_context_length as _get_cl
-                    _fb_cl = _get_cl(
-                        getattr(agent, 'model', resolved_model or '') or '',
-                        getattr(agent, 'base_url', '') or '',
-                    )
+                    _cfg_ctx_len = None
+                    _cfg_custom_providers = None
+                    try:
+                        _model_cfg_for_ctx = _cfg.get('model', {}) if isinstance(_cfg, dict) else {}
+                        if isinstance(_model_cfg_for_ctx, dict):
+                            _raw_cfg_ctx = _model_cfg_for_ctx.get('context_length')
+                            if _raw_cfg_ctx is not None:
+                                try:
+                                    _parsed_cfg_ctx = int(_raw_cfg_ctx)
+                                    if _parsed_cfg_ctx > 0:
+                                        _cfg_ctx_len = _parsed_cfg_ctx
+                                except (TypeError, ValueError):
+                                    pass
+                        _raw_cp = _cfg.get('custom_providers') if isinstance(_cfg, dict) else None
+                        if isinstance(_raw_cp, list):
+                            _cfg_custom_providers = _raw_cp
+                    except Exception:
+                        pass
+                    try:
+                        _fb_cl = _get_cl(
+                            getattr(agent, 'model', resolved_model or '') or '',
+                            getattr(agent, 'base_url', '') or '',
+                            config_context_length=_cfg_ctx_len,
+                            provider=resolved_provider or '',
+                            custom_providers=_cfg_custom_providers,
+                        )
+                    except TypeError:
+                        # Older hermes-agent builds: fall back to legacy 2-arg form.
+                        _fb_cl = _get_cl(
+                            getattr(agent, 'model', resolved_model or '') or '',
+                            getattr(agent, 'base_url', '') or '',
+                        )
                     if _fb_cl:
                         usage['context_length'] = _fb_cl
                 except Exception:
@@ -3130,6 +3322,12 @@ def _run_agent_streaming(
                         resolved_provider = _heal_rt.get('provider')
                     if not resolved_base_url:
                         resolved_base_url = _heal_rt.get('base_url')
+                    if isinstance(resolved_provider, str) and resolved_provider.startswith('custom:'):
+                        _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+                        if not resolved_api_key and _cp_key:
+                            resolved_api_key = _cp_key
+                        if not resolved_base_url and _cp_base:
+                            resolved_base_url = _cp_base
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
                     _heal_kwargs['api_key'] = resolved_api_key

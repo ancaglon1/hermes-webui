@@ -645,6 +645,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!_SMD_SAFE_URL_RE.test(v)){n.removeAttribute('src');n.setAttribute('data-blocked-scheme','1');}
     }
   }
+  function _resetAssistantSegment(){
+    assistantRow=null;
+    assistantBody=null;
+    segmentStart=assistantText.length;
+    _freshSegment=true;
+    _smdEndParser();
+  }
+
   let _lastRenderMs=0;
   function _scheduleRender(){
     if(_renderPending) return;
@@ -725,6 +733,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _scheduleRender();
     });
 
+    source.addEventListener('interim_assistant',e=>{
+      if(!S.session||S.session.session_id!==activeSid) return;
+      const d=JSON.parse(e.data);
+      const visible=String(d&&d.text?d.text:'').trim();
+      const alreadyStreamed=!!(d&&d.already_streamed);
+      if(!visible){
+        return;
+      }
+      if(alreadyStreamed){
+        _resetAssistantSegment();
+        return;
+      }
+      assistantText+=visible;
+      syncInflightAssistantMessage();
+      if(!S.session||S.session.session_id!==activeSid) return;
+      const parsed=_parseStreamState();
+      if(String((parsed&&parsed.displayText)||'').trim()||assistantRow) ensureAssistantRow();
+      _scheduleRender();
+    });
+
     source.addEventListener('reasoning',e=>{
       const d=JSON.parse(e.data);
       reasoningText += d.text || '';
@@ -768,11 +796,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Reset the live assistant row reference so that any text tokens arriving
       // after this tool call create a NEW segment appended below the tool card,
       // rather than updating the old segment that sits above it in the DOM.
-      assistantRow=null;
-      assistantBody=null;
-      segmentStart=assistantText.length; // new segment starts at current text length
-      _freshSegment=true;                // prevent reuse of old DOM node
-      _smdEndParser();                   // finalize current smd parser; new one created on next token
+      _freshSegment=true;
+      _smdEndParser();
+      _resetAssistantSegment();
       scrollIfPinned();
     });
 
@@ -889,6 +915,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
+      const shouldFollowOnDone=isActiveSession&&((typeof _shouldFollowMessagesOnDomReplace==='function')
+        ? _shouldFollowMessagesOnDomReplace()
+        : (typeof _isMessagePaneNearBottom==='function'&&_isMessagePaneNearBottom(1200)));
       if(isActiveSession){
         S.activeStreamId=null;
       }
@@ -968,7 +997,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         // No-reply guard (#373): if agent returned nothing, show inline error
         if(!S.messages.some(m=>m.role==='assistant'&&String(m.content||'').trim())&&!assistantText){removeThinking();S.messages.push({role:'assistant',content:'**No response received.** Check your API key and model selection.'});}
         if(isSessionViewed) _markSessionViewed(completedSid, completedSession.message_count ?? S.messages.length);
-        syncTopbar();renderMessages({preserveScroll:true});loadDir('.');
+        syncTopbar();renderMessages({preserveScroll:true});
+        if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
+        loadDir('.');
         // TTS auto-read: speak the last assistant response if enabled (#499)
         if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
       }
