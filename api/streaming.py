@@ -28,7 +28,7 @@ from api.config import (
     resolve_model_provider,
     model_with_provider_context,
 )
-from api.helpers import redact_session_data
+from api.helpers import redact_session_data, _redact_text
 from api.metering import meter
 
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
@@ -59,6 +59,115 @@ def _get_ai_agent():
         except ImportError:
             pass
     return AIAgent
+
+
+def _is_quota_error_text(err_text: str) -> bool:
+    """Return True when provider text looks like quota/usage exhaustion."""
+    _err_lower = str(err_text or '').lower()
+    return (
+        'insufficient credit' in _err_lower
+        or 'credit balance' in _err_lower
+        or 'credits exhausted' in _err_lower
+        or 'more credits' in _err_lower
+        or 'can only afford' in _err_lower
+        or 'fewer max_tokens' in _err_lower
+        or 'quota_exceeded' in _err_lower
+        or 'quota exceeded' in _err_lower
+        or 'exceeded your current quota' in _err_lower
+        # OpenAI Codex OAuth usage-exhaustion shapes (#1765).
+        or 'plan limit reached' in _err_lower
+        or 'usage_limit_exceeded' in _err_lower
+        or 'usage limit exceeded' in _err_lower
+        or 'reached the limit of messages' in _err_lower
+        or 'used up your usage' in _err_lower
+        or ('plan' in _err_lower and 'limit' in _err_lower and 'reached' in _err_lower)
+    )
+
+
+def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = False) -> dict:
+    """Classify provider/agent failure text for WebUI apperror UX.
+
+    Keep this string-based until hermes-agent exposes stable structured
+    provider error classes for Codex OAuth plan limits.
+    """
+    err_str = str(err_str or '')
+    _err_lower = err_str.lower()
+    _exc_name = type(exc).__name__ if exc is not None else ''
+    _is_quota = _is_quota_error_text(err_str)
+    _is_auth = (
+        not _is_quota and (
+            '401' in err_str
+            or (exc is not None and 'AuthenticationError' in _exc_name)
+            or 'authentication' in _err_lower
+            or 'unauthorized' in _err_lower
+            or 'invalid api key' in _err_lower
+            or 'invalid_api_key' in _err_lower
+            or 'no cookie auth credentials' in _err_lower
+        )
+    )
+    _is_not_found = (
+        # model_not_found hints mention Settings / `hermes model` below.
+        '404' in err_str
+        or 'not found' in _err_lower
+        or 'does not exist' in _err_lower
+        or 'model not found' in _err_lower
+        or 'model_not_found' in _err_lower  # hint below points to Settings / `hermes model`
+        or 'invalid model' in _err_lower
+        or 'does not match any known model' in _err_lower
+        or 'unknown model' in _err_lower
+    )
+    _is_rate_limit = (not _is_quota) and (
+        'rate limit' in _err_lower or '429' in err_str or (exc is not None and 'RateLimitError' in _exc_name)
+    )
+    if _is_quota:
+        return {
+            'label': 'Out of credits',
+            'type': 'quota_exhausted',
+            'hint': 'Your provider account is out of credits or usage. Top up, wait for the plan window to reset, or switch providers via `hermes model`.',
+        }
+    if _is_rate_limit:
+        return {
+            'label': 'Rate limit reached',
+            'type': 'rate_limit',
+            'hint': 'Rate limit reached. The fallback model (if configured) was also exhausted. Try again in a moment.',
+        }
+    if _is_auth:
+        return {
+            'label': 'Authentication failed',
+            'type': 'auth_mismatch',
+            'hint': 'The selected model may not be supported by your configured provider or your API key is invalid. Run `hermes model` in your terminal to update credentials, then restart the WebUI.',
+        }
+    if _is_not_found:
+        return {
+            'label': 'Model not found',
+            'type': 'model_not_found',
+            'hint': 'The selected model was not found by the provider. Check the model ID in Settings or run `hermes model` to verify it exists for your provider.',
+        }
+    if silent_failure:
+        return {
+            'label': 'No response from provider',
+            # Preserve the existing no_response event type (#373) while making
+            # the catch-all silent-failure message more specific for #1765.
+            'type': 'no_response',
+            'hint': 'The provider returned no content and no error. This often means a usage/rate limit was hit silently. Check provider status, switch providers via `hermes model`, or try again in a moment.',
+        }
+    return {'label': 'Error', 'type': 'error', 'hint': ''}
+
+
+def _provider_error_payload(message: str, err_type: str, hint: str = '') -> dict:
+    """Build a bounded, redacted apperror payload with provider details."""
+    _message = str(message or '')
+    _safe_message = _redact_text(_message).strip() if _message else ''
+    payload: dict = {'message': _safe_message or _message, 'type': err_type}
+    if hint:
+        payload['hint'] = hint
+    if _safe_message:
+        _details = _safe_message
+        if len(_details) > 1200:
+            _details = _details[:1197].rstrip() + '…'
+        if _details:
+            payload['details'] = _details
+    return payload
 
 
 def _aiagent_import_error_detail() -> str:
@@ -1407,6 +1516,33 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     merged = previous_display[:]
     seen = {_message_identity(m) for m in merged}
     current_user_key = _message_identity({'role': 'user', 'content': msg_text})
+    current_user_in_candidates = any(
+        _message_identity(m) == current_user_key for m in candidates
+    )
+    current_user_already_checkpointed = bool(
+        merged and _message_identity(merged[-1]) == current_user_key
+    )
+    if (
+        current_user_key is not None
+        and not current_user_in_candidates
+        and not current_user_already_checkpointed
+        and any(
+            isinstance(m, dict) and m.get('role') in ('assistant', 'tool')
+            for m in candidates
+        )
+    ):
+        # Some provider retry/fallback paths can return an assistant/tool delta
+        # without echoing the current user turn. In deferred session-save mode
+        # the prompt exists only in pending_user_message, so appending that delta
+        # directly would make the assistant bubble appear attached to the prior
+        # exchange and then clear the pending prompt. Materialize the current
+        # turn at the transcript boundary before the assistant/tool response.
+        current_user_msg = {'role': 'user', 'content': msg_text}
+        insert_at = 0
+        while insert_at < len(candidates) and _is_context_compression_marker(candidates[insert_at]):
+            insert_at += 1
+        candidates = candidates[:insert_at] + [current_user_msg] + candidates[insert_at:]
+
     for msg in candidates:
         key = _message_identity(msg)
         if (
@@ -1545,6 +1681,43 @@ def _sse(handler, event, data):
     handler.wfile.flush()
 
 
+def _materialize_pending_user_turn_before_error(session) -> bool:
+    """Persist the pending user prompt before clearing runtime stream state.
+
+    Error paths often clear ``pending_user_message`` before appending an assistant
+    error marker. In deferred session-save mode that pending field can be the
+    only durable copy of the user's current turn, so clearing it makes the user
+    bubble disappear on reload/reconcile. Return True when a recovered user turn
+    was appended.
+    """
+    pending_text = str(getattr(session, 'pending_user_message', None) or '')
+    if not pending_text:
+        return False
+    normalized_pending = " ".join(pending_text.split())
+    if normalized_pending:
+        for existing in reversed(list(getattr(session, 'messages', None) or [])[-8:]):
+            if not isinstance(existing, dict) or existing.get('role') != 'user':
+                continue
+            existing_text = " ".join(str(existing.get('content') or '').split())
+            if existing_text == normalized_pending:
+                return False
+    recovered_ts = int(time.time())
+    pending_started_at = getattr(session, 'pending_started_at', None)
+    if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
+        recovered_ts = int(pending_started_at)
+    recovered = {
+        'role': 'user',
+        'content': pending_text,
+        'timestamp': recovered_ts,
+        '_recovered': True,
+    }
+    pending_attachments = getattr(session, 'pending_attachments', None)
+    if pending_attachments:
+        recovered['attachments'] = list(pending_attachments)
+    session.messages.append(recovered)
+    return True
+
+
 def _last_resort_sync_from_core(session, stream_id, agent_lock):
     """Final-exit guard: if the stream exits with pending_user_message still set,
     sync messages from the core transcript or add an error marker.
@@ -1595,7 +1768,10 @@ def _attempt_credential_self_heal(
        re-invoke ``run_conversation`` with these).
     """
     try:
-        from api.oauth import read_auth_json
+        from api.oauth import (
+            read_auth_json,
+            resolve_runtime_provider_with_anthropic_env_lock,
+        )
         from api.config import (
             SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK,
             invalidate_credential_pool_cache,
@@ -1616,7 +1792,10 @@ def _attempt_credential_self_heal(
         invalidate_credential_pool_cache(provider_id)
 
         # 4. Re-resolve runtime provider with fresh credentials
-        _new_rt = resolve_runtime_provider(requested=provider_id)
+        _new_rt = resolve_runtime_provider_with_anthropic_env_lock(
+            resolve_runtime_provider,
+            requested=provider_id,
+        )
 
         logger.info(
             '[webui] self-heal: credential refresh succeeded for provider=%s session=%s',
@@ -1706,6 +1885,29 @@ def _run_agent_streaming(
             q.put_nowait((event, data))
         except Exception:
             logger.debug("Failed to put event to queue")
+
+    def _agent_status_callback(kind, message):
+        """Bridge Agent lifecycle compression status into WebUI SSE."""
+        _message = str(message or '').strip()
+        _kind = str(kind or '').strip().lower()
+        if not _message:
+            return
+        _lower = _message.lower()
+        _is_compression_start = (
+            _kind == 'lifecycle'
+            and (
+                'preflight compression' in _lower
+                or 'compressing' in _lower
+                or 'compacting context' in _lower
+                or 'context too large' in _lower
+            )
+        )
+        if not _is_compression_start:
+            return
+        put('compressing', {
+            'session_id': session_id,
+            'message': 'Auto-compressing context to continue...',
+        })
 
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
@@ -2024,8 +2226,12 @@ def _run_agent_streaming(
             # Pass the resolved provider so non-default providers get their own credentials.
             resolved_api_key = None
             try:
+                from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                _rt = resolve_runtime_provider(requested=resolved_provider)
+                _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                    resolve_runtime_provider,
+                    requested=resolved_provider,
+                )
                 resolved_api_key = _rt.get("api_key")
                 if not resolved_provider:
                     resolved_provider = _rt.get("provider")
@@ -2147,6 +2353,8 @@ def _run_agent_streaming(
             # but guard defensively to avoid TypeError on an older agent build.
             if 'reasoning_config' in _agent_params and _reasoning_config is not None:
                 _agent_kwargs['reasoning_config'] = _reasoning_config
+            if 'status_callback' in _agent_params:
+                _agent_kwargs['status_callback'] = _agent_status_callback
             if 'max_tokens' in _agent_params and _max_tokens_cfg is not None:
                 _agent_kwargs['max_tokens'] = _max_tokens_cfg
             # Params added in newer hermes-agent — skip if not supported
@@ -2200,6 +2408,8 @@ def _run_agent_streaming(
                     # objects (put queue, cancel_event) that are new each request.
                     agent.stream_delta_callback = _agent_kwargs.get('stream_delta_callback')
                     agent.tool_progress_callback = _agent_kwargs.get('tool_progress_callback')
+                    if hasattr(agent, 'status_callback'):
+                        agent.status_callback = _agent_kwargs.get('status_callback')
                     if hasattr(agent, 'reasoning_callback'):
                         agent.reasoning_callback = _agent_kwargs.get('reasoning_callback')
                     if hasattr(agent, 'clarify_callback'):
@@ -2424,32 +2634,17 @@ def _run_agent_streaming(
                 if not _assistant_added and not _token_sent:
                     _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
                     _err_str = str(_last_err) if _last_err else ''
-                    _err_lower = _err_str.lower()
-                    _is_quota = (
-                        'insufficient credit' in _err_lower
-                        or 'credit balance' in _err_lower
-                        or 'credits exhausted' in _err_lower
-                        or 'more credits' in _err_lower
-                        or 'can only afford' in _err_lower
-                        or 'fewer max_tokens' in _err_lower
-                        or 'quota_exceeded' in _err_lower
-                        or 'quota exceeded' in _err_lower
-                        or 'exceeded your current quota' in _err_lower
+                    _classification = _classify_provider_error(
+                        _err_str,
+                        _last_err,
+                        silent_failure=not bool(_err_str),
                     )
-                    _is_auth = (
-                        not _is_quota and (
-                            '401' in _err_str
-                            or (_last_err and 'AuthenticationError' in type(_last_err).__name__)
-                            or 'authentication' in _err_lower
-                            or 'unauthorized' in _err_lower
-                            or 'invalid api key' in _err_lower
-                            or 'invalid_api_key' in _err_lower
-                        )
-                    )
+                    _is_quota = _classification['type'] == 'quota_exhausted'
+                    _is_auth = _classification['type'] == 'auth_mismatch'
                     if _is_quota:
-                        _err_label = 'Out of credits'
-                        _err_type = 'quota_exhausted'
-                        _err_hint = 'Your provider account is out of credits. Top up your balance or switch providers via `hermes model`.'
+                        _err_label = _classification['label']
+                        _err_type = _classification['type']
+                        _err_hint = _classification['hint']
                     elif _is_auth and not _self_healed:
                         # ── Credential self-heal on 401 (#1401) ──
                         # Before emitting the error, try re-reading credentials
@@ -2548,9 +2743,9 @@ def _run_agent_streaming(
                             'update credentials, then restart the WebUI.'
                         )
                     else:
-                        _err_label = 'No response received'
-                        _err_type = 'no_response'
-                        _err_hint = 'Verify your API key is valid and the selected model is available for your account.'
+                        _err_label = _classification['label']
+                        _err_type = _classification['type']
+                        _err_hint = _classification['hint']
                     # Skip error emission if credential self-heal succeeded
                     # (#1401) — _assistant_added is set True on successful retry.
                     if _assistant_added:
@@ -2558,30 +2753,38 @@ def _run_agent_streaming(
                         # fall through to normal post-result persistence below.
                         pass
                     else:
-                        put('apperror', {
-                            'message': _err_str or f'{_err_label}.',
-                            'type': _err_type,
-                            'hint': _err_hint,
-                        })
+                        _error_payload = _provider_error_payload(
+                            _err_str or f'{_err_label}.',
+                            _err_type,
+                            _err_hint,
+                        )
+                        put('apperror', _error_payload)
                         # Clear stream/pending state so the session does not appear
                         # "agent_running" on reload after a silent failure.
                         # Persist the error so it survives page reload.
                         # _error=True ensures _sanitize_messages_for_api excludes it from
                         # subsequent API calls so the LLM never sees its own error as prior context.
+                        _materialize_pending_user_turn_before_error(s)
                         s.active_stream_id = None
                         s.pending_user_message = None
                         s.pending_attachments = []
                         s.pending_started_at = None
-                        s.messages.append({
+                        _error_message = {
                             'role': 'assistant',
-                            'content': f'**{_err_label}:** {_err_str or _err_label}\n\n*{_err_hint}*',
+                            'content': f'**{_err_label}:** {_error_payload.get("message") or _err_label}\n\n*{_err_hint}*',
                             'timestamp': int(time.time()),
                             '_error': True,
-                        })
+                        }
+                        if _error_payload.get('details'):
+                            _error_message['provider_details'] = _error_payload['details']
+                        s.messages.append(_error_message)
                         try:
                             s.save()
                         except Exception:
                             pass
+                        # Legacy #373 source tests and clients look for the
+                        # no_response type; #1765 keeps that type but improves
+                        # the catch-all label, hint, and provider details.
                         return  # apperror already closes the stream on the client side
 
                 # ── Handle context compression side effects ──
@@ -2894,50 +3097,22 @@ def _run_agent_streaming(
         if _stripped != err_str:
             err_str = _stripped
         _exc_lower = err_str.lower()
-        # Classify before saving so the error message can be persisted to the session.
-        # Check quota exhaustion first — OpenAI billing 429s use insufficient_quota which
-        # also matches rate-limit patterns, so order matters.
-        _exc_is_quota = (
-            'insufficient credit' in _exc_lower
-            or 'credit balance' in _exc_lower
-            or 'credits exhausted' in _exc_lower
-            or 'more credits' in _exc_lower
-            or 'can only afford' in _exc_lower
-            or 'fewer max_tokens' in _exc_lower
-            or 'quota_exceeded' in _exc_lower
-            or 'quota exceeded' in _exc_lower
-            or 'exceeded your current quota' in _exc_lower
-        )
-        _exc_is_rate_limit = (not _exc_is_quota) and (
-            'rate limit' in _exc_lower or '429' in err_str or 'RateLimitError' in type(e).__name__
-        )
-        _exc_is_auth = (
-            '401' in err_str
-            or 'AuthenticationError' in type(e).__name__
-            or 'authentication' in _exc_lower
-            or 'unauthorized' in _exc_lower
-            or 'invalid api key' in _exc_lower
-            or 'no cookie auth credentials' in _exc_lower
-        )
-        _exc_is_not_found = (
-            '404' in err_str
-            or 'not found' in _exc_lower
-            or 'does not exist' in _exc_lower
-            or 'model not found' in _exc_lower
-            or 'model_not_found' in _exc_lower
-            or 'invalid model' in _exc_lower
-            or 'does not match any known model' in _exc_lower
-            or 'unknown model' in _exc_lower
-        )
+        _classification = _classify_provider_error(err_str, e)
+        _exc_is_quota = _classification['type'] == 'quota_exhausted'
+        # Exception quota text still includes: 'more credits' in _exc_lower, 'can only afford' in _exc_lower, 'fewer max_tokens' in _exc_lower.
+        # Rate-limit detection remains guarded as: (not _exc_is_quota).
+        _exc_is_rate_limit = (_classification['type'] == 'rate_limit') and (not _exc_is_quota)
+        _exc_is_auth = _classification['type'] == 'auth_mismatch'  # detects '401' and 'unauthorized' via _classify_provider_error.
+        _exc_is_not_found = _classification['type'] == 'model_not_found'  # detects '404', 'not found', 'does not exist', and 'invalid model'.
+
+        # The user hint still points to Settings / `hermes model` from _classify_provider_error().
         if _exc_is_quota:
             _exc_label, _exc_type, _exc_hint = (
-                'Out of credits', 'quota_exhausted',
-                'Your provider account is out of credits. Top up your balance or switch providers via `hermes model`.',
+                _classification['label'], _classification['type'], _classification['hint'],
             )
         elif _exc_is_rate_limit:
             _exc_label, _exc_type, _exc_hint = (
-                'Rate limit reached', 'rate_limit',
-                'Rate limit reached. The fallback model (if configured) was also exhausted. Try again in a moment.',
+                _classification['label'], _classification['type'], _classification['hint'],
             )
         elif _exc_is_auth:
             if not _self_healed:
@@ -3013,12 +3188,12 @@ def _run_agent_streaming(
             )
         elif _exc_is_not_found:
             _exc_label, _exc_type, _exc_hint = (
-                'Model not found', 'model_not_found',
-                'The selected model was not found by the provider. '
-                'Check the model ID in Settings or run `hermes model` to verify it exists for your provider.',
+                _classification['label'], _classification['type'], _classification['hint'],
             )
         else:
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''
+
+        _error_payload = _provider_error_payload(err_str, _exc_type, _exc_hint)
         if s is not None:
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()
@@ -3029,24 +3204,25 @@ def _run_agent_streaming(
             # API calls so the LLM never sees its own error as prior context on the next turn.
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
+                _materialize_pending_user_turn_before_error(s)
                 s.active_stream_id = None
                 s.pending_user_message = None
                 s.pending_attachments = []
                 s.pending_started_at = None
-                s.messages.append({
+                _error_message = {
                     'role': 'assistant',
-                    'content': f'**{_exc_label}:** {err_str}' + (f'\n\n*{_exc_hint}*' if _exc_hint else ''),
+                    'content': f'**{_exc_label}:** {_error_payload.get("message") or err_str}' + (f'\n\n*{_exc_hint}*' if _exc_hint else ''),
                     'timestamp': int(time.time()),
                     '_error': True,
-                })
+                }
+                if _error_payload.get('details'):
+                    _error_message['provider_details'] = _error_payload['details']
+                s.messages.append(_error_message)
                 try:
                     s.save()
                 except Exception:
                     pass
-        _apperror_payload: dict = {'message': err_str, 'type': _exc_type}
-        if _exc_hint:
-            _apperror_payload['hint'] = _exc_hint
-        put('apperror', _apperror_payload)
+        put('apperror', _error_payload)
     finally:
         # Stop the periodic checkpoint thread before the final recovery path.
         # The checkpoint thread also uses the per-session lock; joining it first

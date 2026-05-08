@@ -155,6 +155,26 @@ function handleWorkspaceClose(){
   closeWorkspacePanel();
 }
 
+/**
+ * Set a tooltip on a button, preferring the custom CSS tooltip (`data-tooltip`)
+ * when the element opts in via the `has-tooltip` class. Falls back to the
+ * native `title` attribute for elements that haven't opted in.
+ *
+ * Critical: when the element DOES have data-tooltip, this MUST also clear any
+ * existing native `title` attribute, otherwise the slow ~1.5s native browser
+ * tooltip co-fires alongside the fast custom CSS tooltip — exactly the bug
+ * #1775 reports. Always pair `data-tooltip` with `removeAttribute('title')`.
+ */
+function _setButtonTooltip(btn, text){
+  if(!btn) return;
+  if(btn.hasAttribute('data-tooltip')){
+    btn.setAttribute('data-tooltip', text);
+    if(btn.hasAttribute('title')) btn.removeAttribute('title');
+  } else {
+    btn.title = text;
+  }
+}
+
 function syncWorkspacePanelUI(){
   const {layout,panel,toggleBtn,collapseBtn}= _workspacePanelEls();
   if(!layout||!panel)return;
@@ -167,11 +187,11 @@ function syncWorkspacePanelUI(){
   if(toggleBtn){
     toggleBtn.classList.toggle('active',isOpen);
     toggleBtn.setAttribute('aria-pressed',isOpen?'true':'false');
-    toggleBtn.title=isOpen?'Hide workspace panel':'Show workspace panel';
+    _setButtonTooltip(toggleBtn, isOpen?'Hide workspace panel':'Show workspace panel');
     toggleBtn.disabled=!canBrowse;
   }
   if(collapseBtn){
-    collapseBtn.title=isCompact?'Close workspace panel':'Hide workspace panel';
+    _setButtonTooltip(collapseBtn, isCompact?'Close workspace panel':'Hide workspace panel');
   }
   const hasSession=!!S.session;
   ['btnUpDir','btnNewFile','btnNewFolder','btnRefreshPanel'].forEach(id=>{
@@ -181,7 +201,7 @@ function syncWorkspacePanelUI(){
   const clearBtn=$('btnClearPreview');
   if(clearBtn){
     clearBtn.disabled=!isOpen;
-    clearBtn.title=hasPreview?'Close preview':'Hide workspace panel';
+    _setButtonTooltip(clearBtn, hasPreview?'Close preview':'Hide workspace panel');
     // On desktop, only show the X button when a file preview is open.
     // In browse mode the chevron (btnCollapseWorkspacePanel) already serves
     // as the close control, so showing both produces a duplicate X.
@@ -247,7 +267,7 @@ $('btnSend').onclick=()=>{
   }
   send();
 };
-$('btnAttach').onclick=()=>$('fileInput').click();
+$('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInput').value='';$('fileInput').click();};
 
 // ── Voice input (Web Speech API + MediaRecorder fallback) ───────────────────
 (function(){
@@ -278,7 +298,7 @@ $('btnAttach').onclick=()=>$('fileInput').click();
     btn.classList.toggle('recording',on);
     // Active-state title flips so the tooltip is honest about what
     // pressing the button will do (#1488).
-    btn.title = on ? t('voice_dictate_active') : t('voice_dictate');
+    _setButtonTooltip(btn, on ? t('voice_dictate_active') : t('voice_dictate'));
     status.style.display=on?'':'none';
     if(statusText) statusText.textContent=on?'Listening':'Listening';
     if(!on){ _finalText=''; _prefix=''; }
@@ -709,7 +729,7 @@ window._micPendingSend=window._micPendingSend||false;
   function _activate(){
     _voiceModeActive=true;
     modeBtn.classList.add('active');
-    modeBtn.title=t('voice_mode_toggle_active');
+    _setButtonTooltip(modeBtn, t('voice_mode_toggle_active'));
     showToast(t('voice_mode_active'),1500);
     // If the agent is busy, wait — state will be 'thinking' and we'll detect completion
     if(typeof S!=='undefined'&&S.busy){
@@ -726,7 +746,7 @@ window._micPendingSend=window._micPendingSend||false;
     _voiceModeState='idle';
     _voiceModeThinkingSid=null;
     modeBtn.classList.remove('active');
-    modeBtn.title=t('voice_mode_toggle');
+    _setButtonTooltip(modeBtn, t('voice_mode_toggle'));
     bar.style.display='none';
     clearTimeout(_silenceTimer);
     try{ if(_recognition) _recognition.abort(); }catch(_){}
@@ -807,10 +827,11 @@ $('importFileInput').onchange=async(e)=>{
   }
 };
 // btnRefreshFiles is now panel-icon-btn in header (see HTML)
-function clearPreview(){
+function clearPreview(opts={}){
+  const keepPanelOpen=!!(opts&&opts.keepPanelOpen);
   // Restore directory breadcrumb after closing file preview
   if(typeof renderBreadcrumb==='function') renderBreadcrumb();
-  const closePanelAfter=_workspacePanelMode==='preview';
+  const closePanelAfter=_workspacePanelMode==='preview'&&!keepPanelOpen;
   const pa=$('previewArea');if(pa)pa.classList.remove('visible');
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
   const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
@@ -821,6 +842,7 @@ function clearPreview(){
   const ft=$('fileTree');if(ft)ft.style.display='';
   _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
   if(closePanelAfter)closeWorkspacePanel();
+  else if(keepPanelOpen&&_workspacePanelMode==='preview')openWorkspacePanel('browse');
   else syncWorkspacePanelUI();
 }
 $('btnClearPreview').onclick=handleWorkspaceClose;
@@ -1102,16 +1124,37 @@ function _normalizeAppearance(theme,skin){
   return {theme:nextTheme,skin:nextSkin};
 }
 
+// Sync <meta name="theme-color"> with the active theme's computed --bg.
+// This surfaces the WebUI's exact theme background to:
+//   1. Mobile Safari status bar (the prefers-color-scheme media variants in index.html
+//      cover the pre-load case; this updater handles user-toggled changes mid-session).
+//   2. iOS PWA / Add to Home Screen status bar.
+//   3. Native WKWebView wrappers (e.g. hermes-swift-mac) that read this attribute as
+//      the source of truth for AppKit chrome (tab bar, title bar, traffic-light area)
+//      instead of pixel-sampling — overlay-resistant and IPC-free.
+// Reading getComputedStyle(html).getPropertyValue('--bg') picks up the active skin
+// (Default, Sienna, Sisyphus, Charizard, etc.) so each skin's distinct paint reaches
+// the meta tag.
+function _syncThemeColorMeta(){
+  try{
+    const meta=document.getElementById('hermes-theme-color');
+    if(!meta) return;
+    const bg=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+    if(bg) meta.setAttribute('content',bg);
+  }catch(e){}
+}
+
 function _setResolvedTheme(isDark){
   document.documentElement.classList.toggle('dark',!!isDark);
   const link=document.getElementById('prism-theme');
-  if(!link) return;
+  if(!link){ _syncThemeColorMeta(); return; }
   const want=isDark
     ?'https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css'
     :'https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css';
   // No SRI integrity on theme CSS — jsdelivr edge nodes serve different
   // digests for the same pinned version, causing intermittent blocking (#1100).
   if(link.href!==want){ link.integrity=''; link.href=want; }
+  _syncThemeColorMeta();
 }
 
 function _applyTheme(name){
@@ -1136,6 +1179,7 @@ function _applySkin(name){
   const key=(name||'default').toLowerCase();
   if(key==='default') delete document.documentElement.dataset.skin;
   else document.documentElement.dataset.skin=key;
+  _syncThemeColorMeta();
 }
 
 function _pickTheme(name){

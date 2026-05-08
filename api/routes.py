@@ -313,6 +313,114 @@ def _profile_home_for_cron_job(job: dict):
     return get_hermes_home_for_profile(raw)
 
 
+def _cron_job_subprocess_main(job, execution_profile_home, result_queue):
+    """Run one cron job inside a child process pinned to a profile home."""
+    try:
+        def _run():
+            from cron.scheduler import run_job
+
+            return run_job(job)
+
+        if execution_profile_home is None:
+            result = _run()
+        else:
+            from api.profiles import cron_profile_context_for_home
+
+            with cron_profile_context_for_home(execution_profile_home):
+                result = _run()
+        result_queue.put(("ok", result))
+    except BaseException as exc:  # pragma: no cover - surfaced in parent
+        import traceback
+
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}", traceback.format_exc()))
+
+
+def _cron_subprocess_result_timeout_seconds(job):
+    """Return how long the manual-run parent waits for child result payloads."""
+    for key in ("timeout_seconds", "max_runtime_seconds", "timeout"):
+        raw = (job or {}).get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return max(60.0, value + 30.0)
+    # Manual cron jobs can legitimately run for a long time.  Keep a recovery
+    # path for wedged children without truncating normal long-running jobs.
+    return 6 * 60 * 60.0
+
+
+def _run_cron_job_in_profile_subprocess(job, execution_profile_home):
+    """Execute cron.scheduler.run_job without holding the parent cron env lock.
+
+    cron.scheduler/cron.jobs still rely on process-global HERMES_HOME and module
+    constants, so running the job body in a child process gives each long cron
+    execution its own globals. The parent process only uses cron_profile_context
+    for short metadata reads/writes and remains responsive to unrelated cron UI
+    and API calls while the job runs.
+    """
+    import multiprocessing
+    import queue
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_cron_job_subprocess_main,
+        args=(job, execution_profile_home, result_queue),
+    )
+    process.start()
+
+    result_timeout = _cron_subprocess_result_timeout_seconds(job)
+    status = "error"
+    payload = ["cron run subprocess failed before producing a result", ""]
+    try:
+        try:
+            # Drain the potentially large pickled result before joining.  If the
+            # child puts >~64 KiB on a multiprocessing.Queue, joining first can
+            # deadlock while the child's feeder thread waits for the parent to
+            # read from the pipe.
+            status, *payload = result_queue.get(timeout=result_timeout)
+        except queue.Empty:
+            status = "error"
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                payload = [
+                    f"cron run subprocess produced no result within {result_timeout:g}s and was terminated",
+                    "",
+                ]
+            else:
+                payload = [
+                    f"cron run subprocess exited with code {process.exitcode} without producing a result",
+                    "",
+                ]
+        finally:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if status == "ok":
+                    status = "error"
+                    payload = [
+                        "cron run subprocess did not exit after returning a result",
+                        "",
+                    ]
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+
+    if status == "ok":
+        return payload[0]
+
+    message = payload[0]
+    traceback_text = payload[1] if len(payload) > 1 else ""
+    if traceback_text:
+        logger.error("Manual cron subprocess failed:\n%s", traceback_text)
+    raise RuntimeError(message)
+
+
 def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
     """Wrapper that tracks running state around cron.scheduler.run_job.
 
@@ -321,7 +429,6 @@ def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
     agent config/.env while running. When no job profile is selected, both homes
     are the same and legacy server-default behavior is preserved.
     """
-    from cron.scheduler import run_job  # import here — runs inside a worker thread
     from cron.jobs import mark_job_run, save_job_output
 
     job_id = job.get("id", "")
@@ -336,8 +443,8 @@ def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
             return fn()
 
     try:
-        success, output, final_response, error = _with_cron_home(
-            execution_profile_home, lambda: run_job(job)
+        success, output, final_response, error = _run_cron_job_in_profile_subprocess(
+            job, execution_profile_home
         )
 
         # Persist output and run metadata back to the job's owning cron store,
@@ -481,6 +588,19 @@ from api.helpers import (
 )
 from api.agent_health import build_agent_health_payload
 from api.system_health import build_system_health_payload
+
+
+def _kanban_unknown_endpoint(handler, parsed, method: str) -> bool:
+    """Return a Kanban-specific 404 for stale clients/obsolete endpoint shapes."""
+    return bad(
+        handler,
+        (
+            f"unknown Kanban endpoint: {method} {parsed.path}. "
+            "If this appeared after a WebUI update, your browser may be running "
+            "a stale cached bundle; use Hard refresh now, then reopen Kanban."
+        ),
+        status=404,
+    ) or True
 
 
 def _clear_stale_stream_state(session) -> bool:
@@ -1384,6 +1504,7 @@ from api.workspace import (
     resolve_trusted_workspace,
     validate_workspace_to_add,
     _is_blocked_system_path,
+    _strip_surrounding_quotes,
     _workspace_blocked_roots,
 )
 from api.upload import handle_upload, handle_upload_extract, handle_transcribe
@@ -2388,6 +2509,34 @@ def _handle_plugins(handler, parsed) -> bool:
         )
 
 
+_SHELL_ERROR_HTML = """<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>Hermes is restarting</title>
+</head>
+<body style=\"margin:0;padding:2rem;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#111827;color:#e5e7eb;\">
+  <main style=\"max-width:40rem;margin:10vh auto;line-height:1.5;\">
+    <h1 style=\"font-size:1.5rem;margin:0 0 0.75rem;\">Hermes is restarting…</h1>
+    <p style=\"margin:0;color:#cbd5e1;\">The WebUI shell could not load cleanly. Refresh in a moment if this page does not update automatically.</p>
+  </main>
+</body>
+</html>"""
+
+
+def _serve_shell_unavailable(handler, exc: Exception) -> bool:
+    """Return HTML for shell-route failures so `/` never renders JSON."""
+    logger.warning("Failed to serve WebUI shell route: %s", exc)
+    t(
+        handler,
+        _SHELL_ERROR_HTML,
+        status=503,
+        content_type="text/html; charset=utf-8",
+    )
+    return True
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
@@ -2399,17 +2548,20 @@ def handle_get(handler, parsed) -> bool:
         return _serve_static(handler, stripped)
 
     if parsed.path in ("/", "/index.html") or parsed.path.startswith("/session/"):
-        from urllib.parse import quote
-        from api.updates import WEBUI_VERSION
-        version_token = quote(WEBUI_VERSION, safe="")
-        from api.extensions import inject_extension_tags
+        try:
+            from urllib.parse import quote
+            from api.updates import WEBUI_VERSION
+            version_token = quote(WEBUI_VERSION, safe="")
+            from api.extensions import inject_extension_tags
 
-        html = _INDEX_HTML_PATH.read_text(encoding="utf-8").replace("__WEBUI_VERSION__", version_token)
-        return t(
-            handler,
-            inject_extension_tags(html),
-            content_type="text/html; charset=utf-8",
-        )
+            html = _INDEX_HTML_PATH.read_text(encoding="utf-8").replace("__WEBUI_VERSION__", version_token)
+            return t(
+                handler,
+                inject_extension_tags(html),
+                content_type="text/html; charset=utf-8",
+            )
+        except Exception as exc:
+            return _serve_shell_unavailable(handler, exc)
 
     if parsed.path == "/login":
         _settings = load_settings()
@@ -2511,7 +2663,13 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_get
 
-        return handle_kanban_get(handler, parsed)
+        # Only treat an explicit False as "no route matched". None means the
+        # bridge already sent a response via bad()/j() — emitting our own 404
+        # on top of that produces concatenated JSON bodies on the wire.
+        result = handle_kanban_get(handler, parsed)
+        if result is False:
+            return _kanban_unknown_endpoint(handler, parsed, "GET")
+        return True
     if parsed.path == "/api/wiki/status":
         return _handle_llm_wiki_status(handler, parsed)
     if parsed.path == "/api/logs":
@@ -3186,7 +3344,34 @@ def handle_get(handler, parsed) -> bool:
         import datetime
         identity_map = _load_gateway_session_identity_map()
         sessions_path = _gateway_session_metadata_path()
-        running = bool(identity_map)
+
+        # Detect whether the gateway process is alive, independent of
+        # connected messaging platforms.  An empty identity_map just
+        # means zero platforms connected, not that the gateway is down.
+        #
+        # agent_health.build_agent_health_payload() is the authoritative
+        # signal: it reads gateway.status runtime metadata and returns a
+        # tri-state `alive` field (True/False/None).  This avoids the
+        # false-negative where the gateway is running but has zero active
+        # messaging sessions (empty identity_map).
+        #
+        # `alive` tri-state semantics:
+        #   True  → gateway process is alive
+        #   False → gateway metadata exists but process is down
+        #   None  → no gateway metadata/status available; this WebUI
+        #           setup is probably not configured with a gateway
+        health = build_agent_health_payload()
+        alive = health.get("alive")
+        if alive is True:
+            running = True
+            configured = True
+        elif alive is False:
+            running = False
+            configured = True
+        else:  # alive is None → gateway not configured / unavailable
+            running = bool(identity_map)
+            configured = False
+
         platforms_set: set[str] = set()
         for meta in identity_map.values():
             raw = meta.get("raw_source") or meta.get("platform") or ""
@@ -3213,6 +3398,7 @@ def handle_get(handler, parsed) -> bool:
                 pass
         return j(handler, {
             "running": running,
+            "configured": configured,
             "platforms": platforms,
             "last_active": last_active,
             "session_count": len(identity_map),
@@ -3284,7 +3470,10 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_post
 
-        return handle_kanban_post(handler, parsed, body)
+        result = handle_kanban_post(handler, parsed, body)
+        if result is False:
+            return _kanban_unknown_endpoint(handler, parsed, "POST")
+        return True
     if parsed.path == "/api/dashboard/config":
         from api import dashboard_probe
 
@@ -3892,6 +4081,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/file/reveal":
         return _handle_file_reveal(handler, body)
 
+    if parsed.path == "/api/file/path":
+        return _handle_file_path(handler, body)
+
     # ── Workspace management (POST) ──
     if parsed.path == "/api/workspaces/add":
         return _handle_workspace_add(handler, body)
@@ -4457,7 +4649,10 @@ def handle_patch(handler, parsed) -> bool:
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_patch
 
-        return handle_kanban_patch(handler, parsed, body)
+        result = handle_kanban_patch(handler, parsed, body)
+        if result is False:
+            return _kanban_unknown_endpoint(handler, parsed, "PATCH")
+        return True
     return False
 
 
@@ -4469,7 +4664,10 @@ def handle_delete(handler, parsed) -> bool:
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_delete
 
-        return handle_kanban_delete(handler, parsed, body)
+        result = handle_kanban_delete(handler, parsed, body)
+        if result is False:
+            return _kanban_unknown_endpoint(handler, parsed, "DELETE")
+        return True
     return False
 
 # ── GET route helpers ─────────────────────────────────────────────────────────
@@ -4937,8 +5135,17 @@ def _serve_file_bytes(handler, target: Path, mime: str, disposition: str, cache_
     handler.send_header("Cache-Control", cache_control)
     handler.send_header("Content-Disposition", _content_disposition_value(disposition, target.name))
     if csp:
+        # Sandboxed inline HTML must remain frameable for workspace previews;
+        # X-Frame-Options: DENY would block the iframe before CSP sandbox applies.
         handler.send_header("Content-Security-Policy", csp)
-    _security_headers(handler)
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("Referrer-Policy", "same-origin")
+        handler.send_header(
+            "Permissions-Policy",
+            "camera=(), microphone=(self), geolocation=(), clipboard-write=(self)",
+        )
+    else:
+        _security_headers(handler)
     handler.end_headers()
 
     if content_length:
@@ -5024,8 +5231,9 @@ def _handle_media(handler, parsed):
     ext = target.suffix.lower()
     mime = MIME_MAP.get(ext, "application/octet-stream")
 
-    # Only serve safe media/PDF types inline when explicitly requested. Everything
-    # else remains a download. SVG is always a download (XSS risk).
+    # Only serve safe media/PDF types inline when explicitly requested. HTML is
+    # allowed inline only with a CSP sandbox so "open full page" can work without
+    # granting same-origin access to the WebUI. SVG is always a download (XSS risk).
     _INLINE_IMAGE_TYPES = {
         "image/png", "image/jpeg", "image/gif", "image/webp",
         "image/x-icon", "image/bmp",
@@ -5038,12 +5246,15 @@ def _handle_media(handler, parsed):
     }
     _DOWNLOAD_TYPES = {"image/svg+xml"}  # SVG: XSS risk, force download
     inline_preview = qs.get("inline", [""])[0] == "1"
+    html_inline_ok = inline_preview and mime == "text/html"
     disposition = "inline" if (
         mime not in _DOWNLOAD_TYPES and (
             mime in _INLINE_IMAGE_TYPES or (inline_preview and mime in _INLINE_PREVIEW_TYPES)
+            or html_inline_ok
         )
     ) else "attachment"
-    return _serve_file_bytes(handler, target, mime, disposition, "private, max-age=3600")
+    csp = "sandbox allow-scripts" if html_inline_ok else None
+    return _serve_file_bytes(handler, target, mime, disposition, "private, max-age=3600", csp=csp)
 
 
 def _handle_file_raw(handler, parsed):
@@ -6128,9 +6339,13 @@ def _handle_chat_sync(handler, body):
             # Resolve API key via Hermes runtime provider (matches gateway behaviour)
             _api_key = None
             try:
+                from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
 
-                _rt = resolve_runtime_provider(requested=_provider)
+                _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                    resolve_runtime_provider,
+                    requested=_provider,
+                )
                 _api_key = _rt.get("api_key")
                 # Also use runtime provider/base_url if the webui config didn't resolve them
                 if not _provider:
@@ -6489,7 +6704,13 @@ def _handle_file_reveal(handler, body):
     try:
         target = safe_resolve(Path(s.workspace), body["path"])
         if not target.exists():
-            return bad(handler, "File not found", 404)
+            # Include the resolved server-side path in the error message so
+            # the frontend toast can show *which* file the system expected.
+            # Useful when a stale session row still references a deleted file
+            # (#1764 — Cygnus's screenshot showed a "Failed to reveal: not
+            # found" toast that dropped the path entirely, leaving no clue
+            # what was missing).
+            return bad(handler, f"File not found: {target}", 404)
 
         system = platform.system()
         if system == "Darwin":
@@ -6505,8 +6726,43 @@ def _handle_file_reveal(handler, body):
         return bad(handler, _sanitize_error(e))
 
 
+def _handle_file_path(handler, body):
+    """Resolve a relative workspace-rooted path into an absolute on-disk path.
+
+    The right-click "Copy file path" action (#1764) wants to put the
+    absolute path on the user's clipboard so they can paste it into a
+    terminal, editor, or anywhere else without having to round-trip through
+    the OS file browser. The frontend can't compute the absolute path on
+    its own — `safe_resolve` joins against the session's workspace root
+    which only the server knows. The handler here is a thin lookup; no
+    filesystem mutation, no OS-specific dispatch. We do NOT require the
+    target to exist (unlike `_handle_file_reveal`) — copying the path of a
+    just-deleted file is still useful, and refusing would force callers
+    to special-case 404s for an action that cannot fail destructively.
+    """
+    try:
+        require(body, "session_id", "path")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        s = get_session(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        target = safe_resolve(Path(s.workspace), body["path"])
+        return j(handler, {"ok": True, "path": str(target)})
+    except (ValueError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
+
+
 def _handle_workspace_add(handler, body):
-    path_str = body.get("path", "").strip()
+    # Strip surrounding paired quotes BEFORE any further processing — macOS
+    # Finder's "Copy as Pathname" wraps paths in single quotes, and users
+    # routinely paste those quoted strings into the Add Space input.
+    # Doing this at the route entry means every downstream check (blocked
+    # system path, validate_workspace_to_add, duplicate detection) sees the
+    # cleaned form.
+    path_str = _strip_surrounding_quotes(body.get("path", "").strip())
     name = body.get("name", "").strip()
     auto_create = body.get("create", False)
     if not path_str:
@@ -6841,6 +7097,7 @@ def _handle_session_compress(handler, body):
                 )
 
         import api.config as _cfg
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
         import run_agent as _run_agent
 
@@ -6850,7 +7107,10 @@ def _handle_session_compress(handler, body):
 
         resolved_api_key = None
         try:
-            _rt = _runtime_provider.resolve_runtime_provider(requested=resolved_provider)
+            _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                _runtime_provider.resolve_runtime_provider,
+                requested=resolved_provider,
+            )
             resolved_api_key = _rt.get("api_key")
             if not resolved_provider:
                 resolved_provider = _rt.get("provider")
@@ -7442,6 +7702,7 @@ def _handle_handoff_summary(handler, body):
         # Call LLM for summary.
     try:
         import api.config as _cfg
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
         import run_agent as _run_agent
 
@@ -7460,7 +7721,10 @@ def _handle_handoff_summary(handler, body):
 
         resolved_api_key = None
         try:
-            _rt = _runtime_provider.resolve_runtime_provider(requested=resolved_provider)
+            _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                _runtime_provider.resolve_runtime_provider,
+                requested=resolved_provider,
+            )
             resolved_api_key = _rt.get("api_key")
             if not resolved_provider:
                 resolved_provider = _rt.get("provider")
@@ -7675,6 +7939,49 @@ def _normalize_message_for_import_refresh(message: object) -> object:
     return normalized
 
 
+def _message_has_cli_tool_metadata(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "assistant" and message.get("tool_calls"):
+        return True
+    if message.get("role") == "tool" and (message.get("tool_call_id") or message.get("tool_name") or message.get("name")):
+        return True
+    return False
+
+
+def _strip_cli_tool_metadata_for_refresh(message: object) -> object:
+    if not isinstance(message, dict):
+        return _normalize_message_for_import_refresh(message)
+    normalized = _normalize_message_for_import_refresh(message)
+    if not isinstance(normalized, dict):
+        return normalized
+    for key in ("tool_calls", "tool_call_id", "tool_name", "name"):
+        normalized.pop(key, None)
+    return normalized
+
+
+def _is_cli_tool_metadata_enrichment(existing_messages: list, fresh_messages: list) -> bool:
+    """Return True when fresh messages only add CLI tool metadata.
+
+    Older imports from get_cli_session_messages() persisted assistant/tool rows
+    without tool_calls, tool_call_id, or tool_name. After #1772 the refreshed
+    transcript can have the same length but richer metadata, so re-imports must
+    rebuild the stored sidecar even without a new row.
+    """
+    if not isinstance(existing_messages, list) or not isinstance(fresh_messages, list):
+        return False
+    if len(existing_messages) != len(fresh_messages):
+        return False
+    if any(_message_has_cli_tool_metadata(m) for m in existing_messages):
+        return False
+    if not any(_message_has_cli_tool_metadata(m) for m in fresh_messages):
+        return False
+    for idx, existing_message in enumerate(existing_messages):
+        if _strip_cli_tool_metadata_for_refresh(existing_message) != _strip_cli_tool_metadata_for_refresh(fresh_messages[idx]):
+            return False
+    return True
+
+
 def _is_messages_refresh_prefix_match(existing_messages: list, fresh_messages: list) -> bool:
     """Return True when existing_messages is a prefix of fresh_messages by value.
 
@@ -7719,6 +8026,11 @@ def _handle_session_import_cli(handler, body):
             if _is_messages_refresh_prefix_match(existing.messages, fresh_msgs):
                 existing.messages = fresh_msgs
                 changed = True
+        elif fresh_msgs and _is_cli_tool_metadata_enrichment(existing.messages, fresh_msgs):
+            # Same row count, richer payload: rebuild sidecars imported before
+            # CLI tool metadata was preserved (#1772).
+            existing.messages = fresh_msgs
+            changed = True
         if cli_meta:
             updates = {
                 "is_cli_session": True,
