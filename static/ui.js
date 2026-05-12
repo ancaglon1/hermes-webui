@@ -906,7 +906,7 @@ async function _fetchLiveModels(provider, sel){
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){
       if(typeof syncModelChip==='function') syncModelChip();
-      console.log('[hermes] Live models loaded for',provider+':',added,'new models added');
+      console.debug('[hermes] Live models loaded for',provider+':',added,'new models added');
     }
   }catch(e){
     console.debug('[hermes] Live model fetch failed for',provider,e.message);
@@ -1672,12 +1672,14 @@ function _recordNonMessageScrollIntent(e){
     // input event so later scrollTop decreases caused by layout/windowing do
     // not masquerade as user intent and strand live streaming away from bottom.
     _lastMessageUpwardIntentMs=performance.now();
-    _messageUserUnpinned=true;
     // User is intentionally moving in the transcript. Cancel any delayed
     // scrollToBottom settling that was scheduled by session-load/layout growth.
     _cancelBottomSettle();
-    _nearBottomCount=0;
-    _scrollPinned=false;
+    if(typeof e.deltaY==='number'&&e.deltaY<0){
+      _messageUserUnpinned=true;
+      _nearBottomCount=0;
+      _scrollPinned=false;
+    }
   }
 }
 function _recentMessageUpwardIntent(){
@@ -1717,7 +1719,8 @@ if (typeof window !== 'undefined') window._resetScrollDirectionTracker = _resetS
         if(_scrollPinned) _messageUserUnpinned=false;
       } // #1360
       const btn=$('scrollToBottomBtn');
-      if(btn) btn.style.display=_scrollPinned?'none':'flex';
+      const showBottomButton=!_scrollPinned && el.scrollHeight-top-el.clientHeight>80;
+      if(btn) btn.style.display=showBottomButton?'flex':'none';
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
