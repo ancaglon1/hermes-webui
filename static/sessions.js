@@ -93,6 +93,11 @@ let _sessionCompletionUnread = null;
 let _sessionObservedStreaming = null;
 const _sessionStreamingById = new Map();
 const _sessionListSnapshotById = new Map();
+let _sessionListPointerActive = false;
+let _sessionListLastScrollAt = 0;
+let _pendingSessionListPayload = null;
+let _pendingSessionListApplyTimer = 0;
+const SESSION_LIST_INTERACTION_IDLE_MS = 700;
 
 function _formatSessionModelWithGateway(s){
   if(!s||!s.model)return'';
@@ -654,10 +659,7 @@ async function loadSession(sid){
       updateQueueBadge(sid);
       syncTopbar();renderMessages();
       if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
-      // Kick off loadDir first (issues network requests), then highlight code.
-      // The fetch is dispatched before the CPU-bound Prism pass begins.
       const _dirP=loadDir('.');
-      highlightCode();
       await _dirP;
     }
   }
@@ -1666,6 +1668,18 @@ function _openSessionActionMenu(session, anchorEl){
     ));
   }
   if(!isExternalSession){
+    if(session.worktree_path){
+      menu.appendChild(_buildSessionAction(
+        t('session_worktree_remove'),
+        t('session_worktree_remove_desc', session.worktree_path),
+        ICONS.trash,
+        async()=>{
+          closeSessionActionMenu();
+          await removeWorktree(session);
+        },
+        'danger'
+      ));
+    }
     menu.appendChild(_buildSessionAction(
       t('session_delete'),
       _sessionDeleteDescription(session),
@@ -1758,8 +1772,66 @@ function _mergeOptimisticFirstTurnSessions(fetchedSessions){
   return merged;
 }
 
-async function renderSessionList(){
+function _isSessionListUserInteracting(){
+  const now=Date.now();
+  const list=$('sessionList');
+  const pointerOverList=Boolean(list&&(list.matches(':hover')||list.matches(':focus-within')));
+  return Boolean(
+    _sessionListPointerActive ||
+    pointerOverList ||
+    (_sessionListLastScrollAt && now-_sessionListLastScrollAt<SESSION_LIST_INTERACTION_IDLE_MS)
+  );
+}
+
+function _schedulePendingSessionListApply(){
+  if(_pendingSessionListApplyTimer) clearTimeout(_pendingSessionListApplyTimer);
+  _pendingSessionListApplyTimer=setTimeout(()=>{
+    _pendingSessionListApplyTimer=0;
+    if(!_pendingSessionListPayload) return;
+    if(_isSessionListUserInteracting()){
+      _schedulePendingSessionListApply();
+      return;
+    }
+    const payload=_pendingSessionListPayload;
+    _pendingSessionListPayload=null;
+    if(payload.gen!==_renderSessionListGen) return;
+    _applySessionListPayload(payload.sessData,payload.projData);
+  }, Math.max(120, SESSION_LIST_INTERACTION_IDLE_MS));
+}
+
+function _applySessionListPayload(sessData, projData){
+  // Server's other_profile_count tells us how many sessions exist outside the
+  // active profile so the "Show N from other profiles" toggle can render
+  // without a second round-trip. Stashed on the module for renderSessionListFromCache.
+  _otherProfileCount = sessData.other_profile_count || 0;
+  _allSessions = _mergeOptimisticFirstTurnSessions(sessData.sessions||[]);
+  _clearLineageReportCache();
+  _allProjects = projData.projects||[];
+  // Capture server clock for clock-skew compensation (issue #1144).
+  // server_time is epoch seconds from the server's time.time().
+  // _serverTimeDelta = client - server, so (Date.now() - _serverTimeDelta)
+  // gives an approximation of the current server time.
+  if (typeof sessData.server_time === 'number' && sessData.server_time > 0) {
+    _serverTimeDelta = Date.now() - (sessData.server_time * 1000);
+  }
+  if (typeof sessData.server_tz === 'string') {
+    _serverTz = sessData.server_tz;
+  }
+  _markPollingCompletionUnreadTransitions(_allSessions);
+  const isStreaming = _allSessions.some(s => Boolean(s && s.is_streaming));
+  if (isStreaming) {
+    startStreamingPoll();
+  } else {
+    stopStreamingPoll();
+  }
+  ensureSessionTimeRefreshPoll();
+  renderSessionListFromCache();  // no-ops if rename is in progress
+}
+
+async function renderSessionList(opts={}){
+  const deferWhileInteracting=Boolean(opts&&opts.deferWhileInteracting);
   const _gen = ++_renderSessionListGen;
+  if(!deferWhileInteracting) _pendingSessionListPayload=null;
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
     const allProfilesQS = _showAllProfiles ? '?all_profiles=1' : '';
@@ -1769,32 +1841,12 @@ async function renderSessionList(){
     ]);
     // Discard stale response — a newer renderSessionList() call superseded us.
     if (_gen !== _renderSessionListGen) return;
-    // Server's other_profile_count tells us how many sessions exist outside the
-    // active profile so the "Show N from other profiles" toggle can render
-    // without a second round-trip. Stashed on the module for renderSessionListFromCache.
-    _otherProfileCount = sessData.other_profile_count || 0;
-    _allSessions = _mergeOptimisticFirstTurnSessions(sessData.sessions||[]);
-    _clearLineageReportCache();
-    _allProjects = projData.projects||[];
-    // Capture server clock for clock-skew compensation (issue #1144).
-    // server_time is epoch seconds from the server's time.time().
-    // _serverTimeDelta = client - server, so (Date.now() - _serverTimeDelta)
-    // gives an approximation of the current server time.
-    if (typeof sessData.server_time === 'number' && sessData.server_time > 0) {
-      _serverTimeDelta = Date.now() - (sessData.server_time * 1000);
+    if(deferWhileInteracting&&_isSessionListUserInteracting()){
+      _pendingSessionListPayload={gen:_gen,sessData,projData};
+      _schedulePendingSessionListApply();
+      return;
     }
-    if (typeof sessData.server_tz === 'string') {
-      _serverTz = sessData.server_tz;
-    }
-    _markPollingCompletionUnreadTransitions(_allSessions);
-    const isStreaming = _allSessions.some(s => Boolean(s && s.is_streaming));
-    if (isStreaming) {
-      startStreamingPoll();
-    } else {
-      stopStreamingPoll();
-    }
-    ensureSessionTimeRefreshPoll();
-    renderSessionListFromCache();  // no-ops if rename is in progress
+    _applySessionListPayload(sessData,projData);
   }catch(e){console.warn('renderSessionList',e);}
 }
 
@@ -1812,7 +1864,7 @@ let _sessionTimeRefreshTimer = null;
 function startStreamingPoll(){
   if(_streamingPollTimer) return;
   _streamingPollTimer = setInterval(() => {
-    void renderSessionList();
+    void renderSessionList({deferWhileInteracting:true});
   }, _streamingPollMs);
 }
 
@@ -1832,7 +1884,7 @@ function ensureSessionTimeRefreshPoll(){
 function startGatewayPollFallback(ms){
   const intervalMs = Math.max(5000, Number(ms) || _gatewayFallbackPollMs);
   if(_gatewayPollTimer) clearInterval(_gatewayPollTimer);
-  _gatewayPollTimer = setInterval(() => { renderSessionList(); }, intervalMs);
+  _gatewayPollTimer = setInterval(() => { renderSessionList({deferWhileInteracting:true}); }, intervalMs);
 }
 
 function stopGatewayPollFallback(){
@@ -1855,7 +1907,7 @@ async function probeGatewaySSEStatus(){
     }
     if(resp.status === 503 || data.watcher_running === false){
       startGatewayPollFallback(data.fallback_poll_ms || _gatewayFallbackPollMs);
-      renderSessionList();
+      renderSessionList({deferWhileInteracting:true});
       if(!_gatewaySSEWarningShown && typeof showToast === 'function'){
         showToast('Gateway sync unavailable — falling back to periodic refresh.', 5000);
         _gatewaySSEWarningShown = true;
@@ -1866,7 +1918,7 @@ async function probeGatewaySSEStatus(){
     // Start fallback polling as a safe default; it will self-cancel
     // when the SSE connection recovers and sessions_changed fires.
     startGatewayPollFallback(_gatewayFallbackPollMs);
-    renderSessionList();
+    renderSessionList({deferWhileInteracting:true});
   }finally{
     _gatewayProbeInFlight = false;
   }
@@ -1883,7 +1935,7 @@ function startGatewaySSE(){
         if(data.sessions){
           stopGatewayPollFallback();
           _gatewaySSEWarningShown = false;
-          renderSessionList(); // re-fetch and re-render
+          renderSessionList({deferWhileInteracting:true}); // re-fetch and re-render
           // If the active session received new gateway messages, refresh the conversation view.
           // S.busy check prevents stomping on an in-progress WebUI response.
           // is_cli_session check ensures we only poll import_cli for CLI-originated sessions.
@@ -2387,27 +2439,65 @@ function _sessionVirtualSpacer(height, where){
 }
 
 function _scheduleSessionVirtualizedRender(){
+  _sessionListLastScrollAt=Date.now();
   if(_renamingSid||_sessionVirtualScrollRaf) return;
+  const list=_sessionVirtualScrollList;
+  const total=Number(list&&list.dataset&&list.dataset.sessionVirtualTotal||0);
   // Skip the re-render if the list is below the virtualization threshold —
   // there's no virtual window to recompute, and re-rendering would just
   // rebuild the whole DOM on every scroll tick. Without this guard, the
   // unconditional scroll listener (attached for any list) caused
   // user-facing scroll jumps on small lists. (#1669 follow-up)
-  const list=_sessionVirtualScrollList;
-  if(list){
-    const total=Number(list.dataset.sessionVirtualTotal||0);
-    if(total>0&&total<=SESSION_VIRTUAL_THRESHOLD_ROWS) return;
-  }
-  _sessionVirtualScrollRaf=requestAnimationFrame(()=>{_sessionVirtualScrollRaf=0;renderSessionListFromCache();});
+  if(total>0&&total<=SESSION_VIRTUAL_THRESHOLD_ROWS) return;
+  _sessionVirtualScrollRaf=requestAnimationFrame(()=>{
+    _sessionVirtualScrollRaf=0;
+    const liveList=_sessionVirtualScrollList;
+    const liveTotal=Number(liveList&&liveList.dataset&&liveList.dataset.sessionVirtualTotal||0);
+    if(liveList&&liveTotal>SESSION_VIRTUAL_THRESHOLD_ROWS){
+      const nextWindow=_sessionVirtualWindow({
+        total:liveTotal,
+        scrollTop:liveList.scrollTop||0,
+        viewportHeight:liveList.clientHeight||520,
+        itemHeight:SESSION_VIRTUAL_ROW_HEIGHT,
+        buffer:SESSION_VIRTUAL_BUFFER_ROWS,
+        threshold:SESSION_VIRTUAL_THRESHOLD_ROWS,
+        activeIndex:-1,
+      });
+      const currentStart=Number(liveList.dataset.sessionVirtualStart||0);
+      const currentEnd=Number(liveList.dataset.sessionVirtualEnd||0);
+      if(nextWindow.virtualized&&nextWindow.start===currentStart&&nextWindow.end===currentEnd) return;
+    }
+    renderSessionListFromCache();
+  });
 }
 
 function _ensureSessionVirtualScrollHandler(list){
-  if(!list||_sessionVirtualScrollList===list) return;
+  if(!list) return;
+  if(_sessionVirtualScrollList===list) return;
   if(_sessionVirtualScrollList){
     _sessionVirtualScrollList.removeEventListener('scroll', _scheduleSessionVirtualizedRender);
+    _sessionVirtualScrollList.removeEventListener('pointerdown', _markSessionListPointerDown);
+    _sessionVirtualScrollList.removeEventListener('pointerup', _markSessionListPointerUp);
+    _sessionVirtualScrollList.removeEventListener('pointercancel', _markSessionListPointerUp);
+    _sessionVirtualScrollList.removeEventListener('pointerleave', _markSessionListPointerUp);
   }
   _sessionVirtualScrollList=list;
   list.addEventListener('scroll', _scheduleSessionVirtualizedRender, {passive:true});
+  list.addEventListener('pointerdown', _markSessionListPointerDown, {passive:true});
+  list.addEventListener('pointerup', _markSessionListPointerUp, {passive:true});
+  list.addEventListener('pointercancel', _markSessionListPointerUp, {passive:true});
+  list.addEventListener('pointerleave', _markSessionListPointerUp, {passive:true});
+}
+
+function _markSessionListPointerDown(){
+  _sessionListPointerActive=true;
+  _sessionListLastScrollAt=Date.now();
+}
+
+function _markSessionListPointerUp(){
+  _sessionListPointerActive=false;
+  _sessionListLastScrollAt=Date.now();
+  if(_pendingSessionListPayload) _schedulePendingSessionListApply();
 }
 
 function renderSessionListFromCache(){
@@ -3150,6 +3240,81 @@ if(typeof window!=='undefined'){
     }
     void loadSession(sid);
   });
+}
+
+async function removeWorktree(session){
+  // Fetch status first
+  let status=null;
+  try{
+    const statusResp=await api('/api/session/worktree/status?session_id='+encodeURIComponent(session.session_id));
+    status=statusResp.status;
+  }catch(e){
+    showToast(t('session_worktree_remove_status_failed')+e.message,0,'error');
+    return;
+  }
+  if(!status){
+    showToast(t('session_worktree_remove_status_failed'),0,'error');
+    return;
+  }
+  // Build confirm message
+  let details='';
+  if(!status.exists){
+    details=t('session_worktree_remove_not_exists',status.path);
+  }else{
+    details=t('session_worktree_remove_confirm',status.path);
+    if(status.locked_by_stream){
+      showToast(t('session_worktree_remove_locked_by_stream'),0,'error');
+      return;
+    }
+    if(status.locked_by_terminal){
+      showToast(t('session_worktree_remove_locked_by_terminal'),0,'error');
+      return;
+    }
+    if(status.dirty){
+      details+='\n\n'+t('session_worktree_remove_dirty_warning');
+    }
+    if(status.untracked_count>0){
+      details+='\n'+t('session_worktree_remove_untracked_warning',status.untracked_count);
+    }
+    if(status.ahead_behind&&status.ahead_behind.ahead>0){
+      details+='\n'+t('session_worktree_remove_ahead_warning',status.ahead_behind.ahead);
+    }
+    if(status.dirty||status.untracked_count>0||(status.ahead_behind&&status.ahead_behind.ahead>0)){
+      showToast(t('session_worktree_remove_failed')+t('session_worktree_remove_unsafe_blocked'),0,'error');
+      await showConfirmDialog({
+        message:details,
+        confirmLabel:t('dialog_confirm_btn'),
+        danger:true,
+        focusCancel:true
+      });
+      return;
+    }
+  }
+  const ok=await showConfirmDialog({
+    message:details,
+    confirmLabel:t('session_worktree_remove_confirm_label'),
+    danger:true
+  });
+  if(!ok)return;
+  try{
+    const result=await api('/api/session/worktree/remove',{
+      method:'POST',
+      body:JSON.stringify({session_id:session.session_id, force:false})
+    });
+    const warn=result.warnings&&result.warnings.length?(' '+result.warnings.join(' ')):'';
+    showToast(t('session_worktree_removed')+warn);
+    // Clear the worktree_path from cached session so menu doesn't show stale remove action
+    if(session.worktree_path){
+      session.worktree_path=null;
+    }
+    // Re-render the list if this is the active session
+    if(S.session&&S.session.session_id===session.session_id&&S.session.worktree_path){
+      S.session.worktree_path=null;
+    }
+    await renderSessionList();
+  }catch(e){
+    showToast(t('session_worktree_remove_failed')+e.message,0,'error');
+  }
 }
 
 async function deleteSession(sid){

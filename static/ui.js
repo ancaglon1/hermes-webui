@@ -764,26 +764,67 @@ async function populateModelDropdown(){
     const _modelsRes=await fetch(new URL('api/models',document.baseURI||location.href).href,{credentials:'include'});
     if(_redirectIfUnauth(_modelsRes)) return;
     const data=await _modelsRes.json();
-    if(!data.groups||!data.groups.length) return; // keep HTML defaults
     // Store active provider globally so the send path can warn on mismatch
     window._activeProvider=data.active_provider||null;
     // Store default model so newSession() can apply it (#872).
     // Per-page-load — not synced across browser tabs.
     window._defaultModel=data.default_model||null;
     window._configuredModelBadges=data.configured_model_badges||{};
+
+    const _synthGroupsFromConfigured=()=>{
+      const badgeMap=window._configuredModelBadges||{};
+      const grouped=new Map();
+      const addModel=(providerId,modelId)=>{
+        const pid=String(providerId||'configured').trim()||'configured';
+        const mid=String(modelId||'').trim();
+        if(!mid) return;
+        if(!grouped.has(pid)) grouped.set(pid,[]);
+        const arr=grouped.get(pid);
+        if(arr.some(m=>m.id===mid)) return;
+        arr.push({id:mid,label:getModelLabel(mid)});
+      };
+
+      for(const [modelId,badge] of Object.entries(badgeMap)){
+        const mid=String(modelId||'').trim();
+        // Prefer canonical IDs only; skip derived aliases such as
+        // @provider:model and provider/model to avoid noisy duplicates.
+        if(!mid||mid.startsWith('@')||mid.includes('/')) continue;
+        const provider=(badge&&badge.provider)||'configured';
+        addModel(provider,mid);
+      }
+
+      if(grouped.size===0&&data&&data.default_model){
+        addModel(data.active_provider||'configured',data.default_model);
+      }
+
+      const groups=[];
+      for(const [providerId,models] of grouped.entries()){
+        const display=(String(providerId).startsWith('custom:')
+          ? String(providerId).slice('custom:'.length)
+          : String(providerId))||'Configured';
+        groups.push({provider:display,provider_id:providerId,models});
+      }
+      return groups;
+    };
+
+    const groups=(Array.isArray(data.groups)&&data.groups.length)
+      ? data.groups
+      : _synthGroupsFromConfigured();
+
+    if(!groups.length) return; // no server groups and no configured fallback
     // Clear existing options
     sel.innerHTML='';
     _dynamicModelLabels={};
-    for(const g of data.groups){
+    for(const g of groups){
       const og=document.createElement('optgroup');
       og.label=g.provider;
       if(g.provider_id) og.dataset.provider=g.provider_id;
-      for(const m of g.models){
+      for(const m of (Array.isArray(g.models)?g.models:[])){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
         og.appendChild(opt);
-        _dynamicModelLabels[m.id]=m.label;
+        _dynamicModelLabels[m.id]=m.id;
       }
       // Hydrate the label map from extra_models too (the catalog tail that
       // doesn't render as <option> entries when the picker is capped — see
@@ -793,7 +834,7 @@ async function populateModelDropdown(){
       // instead of falling back to the bare ID. #1567.
       if(Array.isArray(g.extra_models)){
         for(const m of g.extra_models){
-          if(m && m.id) _dynamicModelLabels[m.id]=m.label||m.id;
+          if(m && m.id) _dynamicModelLabels[m.id]=m.id;
         }
       }
       sel.appendChild(og);
@@ -1033,11 +1074,19 @@ function renderModelDropdown(){
     if(child.tagName==='OPTGROUP'){
       const providerId=child.dataset&&child.dataset.provider?child.dataset.provider:'';
       for(const opt of Array.from(child.children)){
-        _modelData.push({value:opt.value,name:esc(opt.textContent||getModelLabel(opt.value)),id:esc(opt.value),group:child.label||'',badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId)});
+        const rawValue=String(opt.value||'');
+        const displayName=rawValue.startsWith('@custom:')
+          ? getModelLabel(rawValue)
+          : (opt.textContent||getModelLabel(rawValue));
+        _modelData.push({value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId)});
       }
     }
     if(child.tagName==='OPTION'){
-      _modelData.push({value:child.value,name:esc(child.textContent||getModelLabel(child.value)),id:esc(child.value),group:'',badge:_getConfiguredModelBadge(child.value,_badgeMap)});
+      const rawValue=String(child.value||'');
+      const displayName=rawValue.startsWith('@custom:')
+        ? getModelLabel(rawValue)
+        : (child.textContent||getModelLabel(rawValue));
+      _modelData.push({value:child.value,name:esc(displayName),id:esc(child.value),group:'',badge:_getConfiguredModelBadge(child.value,_badgeMap)});
     }
   }
   const _existingConfiguredKeys=new Set(_modelData.map(existing=>_normalizeConfiguredModelKey(existing.value)));
@@ -1091,8 +1140,32 @@ function renderModelDropdown(){
       }
     }
     const matches=(m)=>!term||found.has(m.value);
-    const configuredModels=_modelData
-      .filter(m=>m.badge&&matches(m))
+    const configuredCandidates=_modelData
+      .filter(m=>m.badge&&matches(m));
+    const configuredBySemanticKey=new Map();
+    const _configuredProviderKey=(m)=>String((m&&m.badge&&m.badge.provider)||_providerFromModelValue(m&&m.value)||'').toLowerCase();
+    const _configuredModelKey=(m)=>_normalizeConfiguredModelKey(m&&m.value||'');
+    const _configuredDisplayPriority=(m)=>{
+      // Prefer plain IDs over provider-qualified aliases for readability.
+      const v=String((m&&m.value)||'');
+      if(v.startsWith('@')) return 0;
+      if(v.includes('/')) return 1;
+      return 2;
+    };
+    for(const candidate of configuredCandidates){
+      const semanticKey=`${_configuredProviderKey(candidate)}::${_configuredModelKey(candidate)}`;
+      const existing=configuredBySemanticKey.get(semanticKey);
+      if(!existing){
+        configuredBySemanticKey.set(semanticKey,candidate);
+        continue;
+      }
+      const candidatePriority=_configuredDisplayPriority(candidate);
+      const existingPriority=_configuredDisplayPriority(existing);
+      if(candidatePriority>existingPriority){
+        configuredBySemanticKey.set(semanticKey,candidate);
+      }
+    }
+    const configuredModels=[...configuredBySemanticKey.values()]
       .sort((a,b)=>{
         const configuredRankA=_configuredRank(a.badge);
         const configuredRankB=_configuredRank(b.badge);
@@ -1112,17 +1185,28 @@ function renderModelDropdown(){
       configuredHeading.className='model-group';
       configuredHeading.textContent=t('model_group_configured')||'Configured';
       dd.appendChild(configuredHeading);
+      // 为了显示原始ID，建立 badgeKeyMap: badge对象->原始key
+      const badgeKeyMap = new Map();
+      for(const [k, v] of Object.entries(_badgeMap)){
+        badgeKeyMap.set(v, k);
+      }
       for(const m of configuredModels){
         const row=document.createElement('div');
         row.className='model-opt'+(m.value===sel.value?' active':'');
-        // Add provider info to badge label (e.g., "Primary (jingdong)")
-        let badgeLabel=m.badge?(m.badge.label||'Configured'):'';
-        if(m.badge&&m.badge.provider){
-          const providerName=m.badge.provider.replace(/^custom:/,'').split('/')[0];
-          badgeLabel+=` (${providerName})`;
+        let badgeLabel = '';
+        let modelName = m.name;
+        if (m.badge) {
+          // 直接用badge的原始key（即config.yaml里的ID）
+          const rawId = badgeKeyMap.get(m.badge) || m.value || m.badge.label || 'Configured';
+          badgeLabel = rawId;
+          modelName = rawId; // model-opt-name直接用原始ID
+          if(m.badge.provider){
+            const providerName=m.badge.provider.replace(/^custom:/,'').split('/')[0];
+            badgeLabel += ` (${providerName})`;
+          }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${m.name}</span>${badgeHtml}</div><span class="model-opt-id">${m.id}</span>`;
+        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${m.id}</span>`;
         row.onclick=()=>selectModelFromDropdown(m.value);
         dd.appendChild(row);
       }
@@ -2086,6 +2170,17 @@ function _fmtOllamaLabel(mid){
 
 function getModelLabel(modelId){
   if(!modelId) return 'Unknown';
+  const rawId=String(modelId||'');
+  // Preserve custom gateway model IDs exactly as configured.
+  // Examples:
+  //   @custom:ai_gateway:Qwen3.6-35B-A3B -> Qwen3.6-35B-A3B
+  //   @custom:qwen397b-64k               -> qwen397b-64k
+  if(rawId.startsWith('@custom:')){
+    const rest=rawId.slice('@custom:'.length);
+    if(rest.includes(':')) return rest.slice(rest.lastIndexOf(':')+1)||rawId;
+    if(rest.includes('/')) return rest.split('/').pop()||rawId;
+    return rest||rawId;
+  }
   // Check dynamic labels first, then fall back to splitting the ID
   if(_dynamicModelLabels[modelId]) return _dynamicModelLabels[modelId];
   // Static fallback for common models
@@ -2096,11 +2191,15 @@ function getModelLabel(modelId){
   // Strip @provider: prefix if present (e.g. @ollama-cloud:kimi-k2.6)
   if (_last.startsWith('@') && _last.includes(':')) _last = _last.split(':').slice(1).join(':');
   const looksLikeOllamaTag = /^[a-z0-9][\w.-]*:[\w.-]+$/i.test(_last);
+  const atProvider=(rawId.startsWith('@')&&rawId.includes(':'))
+    ? rawId.slice(1,rawId.indexOf(':')).toLowerCase()
+    : '';
+  const allowOllamaFormat=!atProvider||atProvider.startsWith('ollama');
   // Narrow: only apply Ollama formatter to IDs with explicit @ollama prefix or colon-tag format.
   // Avoids reformatting bare provider model IDs like claude-sonnet-4-6 or gpt-4o.
   const looksLikeBareOllamaId = modelId.startsWith('@ollama') || looksLikeOllamaTag;
   const ollamaLabel = _fmtOllamaLabel(_last);
-  if ((modelId.startsWith('ollama/') || modelId.startsWith('@ollama') || looksLikeOllamaTag || looksLikeBareOllamaId) && ollamaLabel !== _last) {
+  if (allowOllamaFormat && (modelId.startsWith('ollama/') || modelId.startsWith('@ollama') || looksLikeOllamaTag || looksLikeBareOllamaId) && ollamaLabel !== _last) {
     return ollamaLabel;
   }
   return _last || 'Unknown';
@@ -4475,9 +4574,11 @@ function _compressionAnchorIndex(visWithIdx, anchorKey, fallbackIdx=null){
     for(let i=visWithIdx.length-1;i>=0;i--){
       const candidate=_compressionMessageAnchorKey(visWithIdx[i].m);
       if(!candidate) continue;
+      const anchorTs=String(anchorKey.ts??'');
+      const candidateTs=String(candidate.ts??'');
       if(
         candidate.role===String(anchorKey.role||'') &&
-        String(candidate.ts??'')===String(anchorKey.ts??'') &&
+        (!anchorTs||!candidateTs||candidateTs===anchorTs) &&
         String(candidate.text||'')===String(anchorKey.text||'') &&
         Number(candidate.attachments||0)===Number(anchorKey.attachments||0)
       ){
@@ -4486,6 +4587,24 @@ function _compressionAnchorIndex(visWithIdx, anchorKey, fallbackIdx=null){
     }
   }
   return typeof fallbackIdx==='number' ? fallbackIdx : null;
+}
+function _latestCompressionReferenceMessage(messages, summaryText=''){
+  if(!Array.isArray(messages)||!messages.length) return {message:null, rawIdx:-1};
+  const summaryNorm=String(summaryText||'').replace(/\s+/g,' ').trim();
+  for(let i=messages.length-1;i>=0;i--){
+    const m=messages[i];
+    if(!_isContextCompactionMessage(m)) continue;
+    if(!summaryNorm) return {message:m, rawIdx:i};
+    let content='';
+    try{
+      content=String(msgContent(m)||'');
+    }catch(_){
+      content=String((m&&m.content)||'');
+    }
+    const contentNorm=content.replace(/\s+/g,' ').trim();
+    if(contentNorm.includes(summaryNorm)) return {message:m, rawIdx:i};
+  }
+  return {message:null, rawIdx:-1};
 }
 function _compressionReferenceCardHtml(text, open=false){
   const preview=text.split(/\n+/).filter(Boolean).slice(0,2).join(' ');
@@ -4854,8 +4973,7 @@ function renderMessages(options){
       _wireMessageWindowLoadEarlierButton();
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
-      requestAnimationFrame(()=>{highlightCode();addCopyButtons();loadDiffInline();loadCsvInline();loadExcalidrawInline();loadPdfInline();loadHtmlInline();renderMermaidBlocks();renderKatexBlocks();});
-      requestAnimationFrame(()=>{highlightCode();addCopyButtons();initTreeViews();loadPdfInline();loadHtmlInline();renderMermaidBlocks();renderKatexBlocks();});
+      requestAnimationFrame(()=>postProcessRenderedMessages(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
       if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
       return;
@@ -4890,7 +5008,10 @@ function renderMessages(options){
   $('emptyState').style.display=(vis.length||preservedCompressionTaskMessages.length)?'none':'';
   inner.innerHTML='';
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
-  const referenceMessage=S.messages.find(m=>_isContextCompactionMessage(m));
+  const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
+    S.messages,
+    sessionCompressionSummary
+  );
   const referenceText=referenceMessage
     ? msgContent(referenceMessage)||String(referenceMessage.content||'')
     : sessionCompressionSummary;
@@ -4941,13 +5062,19 @@ function renderMessages(options){
       break;
     }
   }
-  const insertionAnchor=_compressionAnchorIndex(
-    renderVisWithIdx,
+  const insertionAnchorFull=_compressionAnchorIndex(
+    visWithIdx,
     compressionState ? compressionState.anchorMessageKey : sessionCompressionAnchorKey,
     compressionState
       ? (typeof compressionState.anchorVisibleIdx==='number' ? compressionState.anchorVisibleIdx : compressionState.anchorRawIdx)
       : sessionCompressionAnchor
   );
+  let insertionAnchor=null;
+  if(typeof insertionAnchorFull==='number'){
+    if(insertionAnchorFull<windowStart) insertionAnchor=renderVisWithIdx.length?0:null;
+    else if(insertionAnchorFull<windowStart+renderVisWithIdx.length) insertionAnchor=insertionAnchorFull-windowStart;
+    else insertionAnchor=renderVisWithIdx.length?renderVisWithIdx.length-1:null;
+  }
   let _prevSepKey=null;
   let currentAssistantTurn=null;
   const assistantSegments=new Map();
@@ -5016,7 +5143,8 @@ function renderMessages(options){
     }
     let bodyHtml = isUser ? _renderUserFencedBlocks(displayContent) : renderMd(_stripXmlToolCallsDisplay(String(displayContent)));
     if(!isUser&&m.provider_details){
-      bodyHtml += `<details class="provider-error-details"><summary>Provider details</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
+      const summary=m.provider_details_label||'Provider details';
+      bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
@@ -5166,7 +5294,8 @@ function renderMessages(options){
   const handoffSummaryStates=_collectHandoffSummaryStates(S.messages);
 
   _insertCompressionLikeNode(compressionNode);
-  _insertCompressionLikeNode(referenceNode);
+  if(referenceNode&&referenceMessageRawIdx>=0) _insertCompressionLikeNodeByRawIdx(referenceNode, referenceMessageRawIdx);
+  else _insertCompressionLikeNode(referenceNode);
   _insertCompressionLikeNode(preservedOnlyNode, preservedOnlyAnchor);
   _insertCompressionLikeNode(handoffState?_handoffCardsNode(handoffState):null, renderVisWithIdx.length?renderVisWithIdx.length-1:null);
   for(const entry of handoffSummaryStates){
@@ -5412,8 +5541,7 @@ function renderMessages(options){
   // scrollIfPinned() respects _scrollPinned, so it's a no-op if user scrolled up.
   _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
   // Apply syntax highlighting after DOM is built
-  requestAnimationFrame(()=>{highlightCode();addCopyButtons();loadDiffInline();loadCsvInline();loadExcalidrawInline();loadPdfInline();loadHtmlInline();renderMermaidBlocks();renderKatexBlocks();});
-  requestAnimationFrame(()=>{highlightCode();addCopyButtons();initTreeViews();loadPdfInline();loadHtmlInline();renderMermaidBlocks();renderKatexBlocks();}); 
+  requestAnimationFrame(()=>postProcessRenderedMessages(inner));
   // Refresh todo panel if it's currently open
   if(typeof loadTodos==='function' && document.getElementById('panelTodos') && document.getElementById('panelTodos').classList.contains('active')){
     loadTodos();
@@ -5518,6 +5646,7 @@ function _syncToolCallGroupSummary(group){
   if(label){
     if(toolCount) label.textContent=`Activity: ${toolCount} tool${toolCount===1?'':'s'}`;
     else label.textContent='Activity';
+    label.setAttribute('data-sweep-label', label.textContent);
   }
   if(durationEl){
     if(group.getAttribute('data-live-tool-call-group')==='1'){
@@ -5724,6 +5853,19 @@ async function regenerateResponse(btn) {
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
+function postProcessRenderedMessages(container) {
+  highlightCode(container);
+  addCopyButtons(container);
+  loadDiffInline(container);
+  loadCsvInline(container);
+  loadExcalidrawInline(container);
+  loadPdfInline(container);
+  loadHtmlInline(container);
+  renderMermaidBlocks(container);
+  renderKatexBlocks(container);
+  initTreeViews(container);
+}
+
 function highlightCode(container) {
   // Apply Prism.js syntax highlighting to all code blocks in container (or whole messages area)
   if(typeof Prism === 'undefined' || !Prism.highlightAllUnder) return;
@@ -5747,8 +5889,9 @@ function _loadJsyamlThen(cb){
   document.head.appendChild(s);
 }
 
-function initTreeViews(){
-  document.querySelectorAll('.code-tree-wrap:not([data-tree-init])').forEach(wrap=>{
+function initTreeViews(container){
+  const root=container||document;
+  root.querySelectorAll('.code-tree-wrap:not([data-tree-init])').forEach(wrap=>{
     const rawText=wrap.dataset.raw;
     const lang=wrap.dataset.lang;
     let parsed=null;
@@ -5905,9 +6048,10 @@ function addCopyButtons(container){
 let _mermaidLoading=false;
 let _mermaidReady=false;
 
-function loadDiffInline(){
+function loadDiffInline(container){
   const DIFF_MAX_SIZE=512*1024; // 512 KB cap for inline diff rendering
-  document.querySelectorAll('.diff-inline-load:not([data-loaded])').forEach(el=>{
+  const root=container||document;
+  root.querySelectorAll('.diff-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     fetch('api/media?path='+encodeURIComponent(path))
@@ -5932,9 +6076,10 @@ function loadDiffInline(){
   });
 }
 
-function loadCsvInline(){
+function loadCsvInline(container){
   const CSV_MAX_SIZE=256*1024; // 256 KB cap for inline CSV rendering
-  document.querySelectorAll('.csv-inline-load:not([data-loaded])').forEach(el=>{
+  const root=container||document;
+  root.querySelectorAll('.csv-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     fetch('api/media?path='+encodeURIComponent(path))
@@ -5967,9 +6112,10 @@ function loadCsvInline(){
   });
 }
 
-function loadExcalidrawInline(){
+function loadExcalidrawInline(container){
   const EXCALIDRAW_MAX_SIZE=512*1024; // 512 KB cap
-  document.querySelectorAll('.excalidraw-inline-load:not([data-loaded])').forEach(el=>{
+  const root=container||document;
+  root.querySelectorAll('.excalidraw-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     fetch('api/media?path='+encodeURIComponent(path))
@@ -6093,9 +6239,10 @@ function _renderExcalidrawCanvases(){
 // the full buffer is received — ideally the server would enforce it before
 // streaming (out of scope for this client-side PR).
 let _pdfjsReady=false, _pdfjsLoading=false;
-function loadPdfInline(){
+function loadPdfInline(container){
   const PDF_MAX_SIZE=4*1024*1024; // 4 MB cap for inline PDF preview
-  document.querySelectorAll('.pdf-preview-load:not([data-loaded])').forEach(el=>{
+  const root=container||document;
+  root.querySelectorAll('.pdf-preview-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
@@ -6167,9 +6314,10 @@ function loadPdfInline(){
 }
 
 // ── HTML inline preview (sandboxed iframe) ─────────────────────────────────
-function loadHtmlInline(){
+function loadHtmlInline(container){
   const HTML_MAX_SIZE=256*1024; // 256 KB cap for inline HTML preview
-  document.querySelectorAll('.html-preview-load:not([data-loaded])').forEach(el=>{
+  const root=container||document;
+  root.querySelectorAll('.html-preview-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
@@ -6192,8 +6340,9 @@ function loadHtmlInline(){
   });
 }
 
-function renderMermaidBlocks(){
-  const blocks=document.querySelectorAll('.mermaid-block:not([data-rendered])');
+function renderMermaidBlocks(container){
+  const root=container||document;
+  const blocks=root.querySelectorAll('.mermaid-block:not([data-rendered])');
   if(!blocks.length) return;
   if(!_mermaidReady){
     if(!_mermaidLoading){
@@ -6242,8 +6391,9 @@ function renderMermaidBlocks(){
 let _katexLoading=false;
 let _katexReady=false;
 
-function renderKatexBlocks(){
-  const blocks=document.querySelectorAll('.katex-block:not([data-rendered]),.katex-inline:not([data-rendered])');
+function renderKatexBlocks(container){
+  const root=container||document;
+  const blocks=root.querySelectorAll('.katex-block:not([data-rendered]),.katex-inline:not([data-rendered])');
   if(!blocks.length) return;
   if(!_katexReady){
     if(!_katexLoading){
@@ -6286,6 +6436,20 @@ function _thinkingMarkup(text=''){
   return (clean&&String(clean).trim())
     ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
     : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
+}
+function _renderThinkingInto(row,text=''){
+  if(!row) return;
+  const clean=_sanitizeThinkingDisplayText(text);
+  if(!clean){
+    row.innerHTML=_thinkingMarkup(text);
+    return;
+  }
+  const pre=row.querySelector('.thinking-card-body pre');
+  if(pre){
+    pre.textContent=clean;
+    return;
+  }
+  row.innerHTML=_thinkingMarkup(text);
 }
 function finalizeThinkingCard(){
   // Guard: only finalize thinking card if we're looking at the session that started it.
@@ -6367,8 +6531,10 @@ function appendThinking(text=''){
       if(anchor) anchor.insertAdjacentElement('afterend', row);
       else blocks.appendChild(row);
     }
-    row.className=(text&&String(text).trim())?'assistant-segment thinking-card-row':'assistant-segment';
-    row.innerHTML=_thinkingMarkup(text);
+    const clean=_sanitizeThinkingDisplayText(text);
+    const hasClean=!!String(clean||'').trim();
+    row.className=hasClean?'assistant-segment thinking-card-row':'assistant-segment';
+    _renderThinkingInto(row,text);
     scrollIfPinned();
     // Auto-scroll the thinking card body to bottom if the user is watching
     // (scroll pinned). If the user scrolled up to read history, leave it alone.
@@ -6397,7 +6563,7 @@ function appendThinking(text=''){
     row.setAttribute('data-thinking-active','1');
     body.insertBefore(row, body.firstChild);
   }
-  row.innerHTML=_thinkingMarkup(text);
+  _renderThinkingInto(row,text);
   _syncToolCallGroupSummary(group);
   scrollIfPinned();
   if(_scrollPinned){
