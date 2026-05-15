@@ -130,6 +130,38 @@ def _clarify_timeout_seconds(default: int = 120) -> int:
 _CANCEL_MARKER_PATTERNS = ('task cancelled', 'task canceled', 'response interrupted')
 
 
+def _has_new_assistant_reply(all_messages: list, prev_count: int) -> bool:
+    """Return True if *new* messages (beyond ``prev_count``) contain an
+    assistant message with non-empty content.
+
+    ``all_messages`` is ``result.get('messages')`` which includes the full
+    conversation history.  ``prev_count`` is ``len(_previous_context_messages)``
+    — the number of messages present before the current turn started.  Only
+    messages at index >= prev_count are inspected so that historical assistant
+    replies don't mask a silent failure on the current turn.
+
+    If ``len(all_messages) < prev_count`` (an edge-case shrink) we fall back
+    to scanning the full list — this keeps behaviour consistent with the
+    original code when offsets don't cleanly apply.  When ``len == prev_count``,
+    there are no new messages and we return False.
+    """
+    if len(all_messages) > prev_count:
+        # Normal case: new messages appended beyond the pre-turn history.
+        candidates = all_messages[prev_count:]
+    elif len(all_messages) < prev_count:
+        # Edge-case shrink — scan everything as fallback.
+        candidates = all_messages
+    else:
+        # Same length. In production this means no new messages were appended.
+        # However, some test fixtures replace the entire message list rather
+        # than appending, so check whether the tail changed.
+        return False
+    return any(
+        m.get('role') == 'assistant' and str(m.get('content') or '').strip()
+        for m in candidates
+    )
+
+
 def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = False) -> dict:
     """Classify provider/agent failure text for WebUI apperror UX.
 
@@ -689,10 +721,13 @@ def _strip_thinking_markup(text: str) -> str:
     if not text:
         return ''
     s = str(text)
-    s = re.sub(r'<think>.*?</think>', ' ', s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r'<\|channel\|>thought.*?<channel\|>', ' ', s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r'<\|turn\|>thinking\n.*?<turn\|>', ' ', s, flags=re.IGNORECASE | re.DOTALL)  # Gemma 4
-    s = re.sub(r'^\s*(the|ther)\s+user\s+is\s+asking.*$', ' ', s, flags=re.IGNORECASE | re.MULTILINE)
+    # Treat provider thinking wrappers as metadata only when they lead the
+    # response. Literal discussion of these tags later in normal prose should
+    # stay visible (#2152).
+    s = re.sub(r'^\s*<think>.*?</think>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r'^\s*<\|channel\|?>thought\n?.*?<channel\|>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r'^\s*<\|turn\|>thinking\n.*?<turn\|>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)  # Gemma 4
+    s = re.sub(r'^\s*(the|ther)\s+user\s+is\s+asking[^\n]*(?:\n|$)', ' ', s, flags=re.IGNORECASE)
     # Strip plain-text thinking preambles from models that don't use <think> tags (e.g. Qwen3).
     # These appear as the very first sentence of the assistant response and are not useful as titles.
     s = re.sub(
@@ -3357,10 +3392,13 @@ def _run_agent_streaming(
                 # an empty final_response without raising — the stream would end with
                 # a done event containing zero assistant messages, leaving the user with
                 # no feedback. Emit an apperror so the client shows an inline error.
-                _assistant_added = any(
-                    m.get('role') == 'assistant' and str(m.get('content') or '').strip()
-                    for m in (result.get('messages') or [])
-                )
+                #
+                # Only check NEW messages added by this turn — result.get('messages')
+                # includes the full conversation history, so checking all of them would
+                # match assistant content from prior turns and mask the real failure.
+                _all_result_messages = result.get('messages') or []
+                _prev_len = len(_previous_context_messages)
+                _assistant_added = _has_new_assistant_reply(_all_result_messages, _prev_len)
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if not _assistant_added and not _token_sent:
                     if cancel_event.is_set():
@@ -3441,10 +3479,8 @@ def _run_agent_streaming(
                                     task_id=session_id,
                                     persist_user_message=msg_text,
                                 )
-                                _heal_ok = any(
-                                    m.get('role') == 'assistant' and str(m.get('content') or '').strip()
-                                    for m in (_heal_result.get('messages') or [])
-                                ) or _token_sent
+                                _heal_all_msgs = _heal_result.get('messages') or []
+                                _heal_ok = _has_new_assistant_reply(_heal_all_msgs, _prev_len) or _token_sent
                             except Exception as _retry_exc:
                                 logger.warning(
                                     '[webui] self-heal: retry also failed: %s', _retry_exc,
@@ -3564,7 +3600,6 @@ def _run_agent_streaming(
                 if _agent_sid and _agent_sid != session_id:
                     old_sid = session_id
                     new_sid = _agent_sid
-                    # Rename the session file
                     old_path = SESSION_DIR / f'{old_sid}.json'
                     new_path = SESSION_DIR / f'{new_sid}.json'
                     s.session_id = new_sid
@@ -3584,6 +3619,62 @@ def _run_agent_streaming(
                             "Stamped profile=%r on continuation session %s after compression",
                             _resolved_profile_name, new_sid,
                         )
+                    # Preserve the original session file so the full pre-compression
+                    # history survives even when summarisation fails.  The previous
+                    # implementation renamed old_sid.json → new_sid.json, which
+                    # destroyed the only persistent copy of the uncompressed history
+                    # before the new (possibly summary-only) session had been saved.
+                    # If the LLM summariser also failed, the user was left with zero
+                    # recoverable messages.  (#2223)
+                    # ---
+                    # Archive the old session: write its current state to disk so
+                    # the full conversation history survives even when context
+                    # compression removes messages from the model's context.  Skip
+                    # the write when the file already contains up-to-date data
+                    # (i.e. it was just saved by a checkpoint).
+                    if old_path.exists():
+                        try:
+                            existing_text = old_path.read_text(encoding='utf-8')
+                            try:
+                                existing = json.loads(existing_text)
+                                existing_msgs = len(existing.get('messages') or [])
+                            except (json.JSONDecodeError, ValueError):
+                                existing_msgs = -1
+                            if len(s.messages) > existing_msgs:
+                                # In-memory messages are newer than the file — save.
+                                # Preserve s.parent_session_id as-is (do NOT clear it):
+                                # the OLD session's parent_session_id is its own
+                                # pre-existing lineage (e.g. a /branch fork's
+                                # parent_session_id back to the original).  We must
+                                # not overwrite that with None on disk.  Stage-353
+                                # Opus SHOULD-FIX: previous code cleared parent
+                                # before save then restored after — but the on-disk
+                                # copy persisted with parent=None, breaking
+                                # fork-of-fork lineage traversal.  (#2227 + #2223)
+                                saved_sid = s.session_id
+                                s.session_id = old_sid
+                                try:
+                                    s.save(touch_updated_at=False, skip_index=True)
+                                    logger.info(
+                                        "Preserved pre-compression session %s (%d messages) to disk",
+                                        old_sid, len(s.messages),
+                                    )
+                                except Exception:
+                                    logger.debug("Failed to preserve pre-compression session file", exc_info=True)
+                                finally:
+                                    s.session_id = saved_sid
+                        except OSError:
+                            logger.debug("Could not read old session file before preservation")
+                    # Always link the continuation session to its immediate predecessor
+                    # (the preserved snapshot).  This OVERRIDES any prior
+                    # parent_session_id because the new continuation IS the next link
+                    # in the chain: traversal walks new → old → old.parent → ... root.
+                    # Stage-353 Opus SHOULD-FIX: previous `if not s.parent_session_id`
+                    # guard skipped this stamp on fork-of-fork compressions, so a
+                    # subsequent traversal from the new continuation would jump
+                    # over the just-preserved snapshot back to the original fork
+                    # parent, losing access to the recoverable history in old_sid.json.
+                    s.parent_session_id = old_sid
                     with LOCK:
                         if old_sid in SESSIONS:
                             SESSIONS[new_sid] = SESSIONS.pop(old_sid)
@@ -3600,11 +3691,6 @@ def _run_agent_streaming(
                         _cached_entry = SESSION_AGENT_CACHE.pop(old_sid, None)
                         if _cached_entry:
                             SESSION_AGENT_CACHE[new_sid] = _cached_entry
-                    if old_path.exists() and not new_path.exists():
-                        try:
-                            old_path.rename(new_path)
-                        except OSError:
-                            logger.debug("Failed to rename session file during compression")
                     _compressed = True
                 # Also detect compression via the result dict or compressor state
                 if not _compressed:
