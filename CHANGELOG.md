@@ -3,6 +3,79 @@
 
 ## [Unreleased]
 
+## [v0.51.118] — 2026-05-22 — Release CP (stage-pr2773 — 1-PR hotfix — v0.51.117 brick fix: chat input restored)
+
+### Fixed
+
+- **PR #2773** by @nesquena-hermes — fix(chat): rename `_inflightStateLimits()` in `static/ui.js` to `_getInflightStateLimits()` so it no longer collides with the `window._inflightStateLimits` config object set in `static/boot.js`. Closes #2771. The v0.51.117 in-flight-recovery quota fix (#2766) declared a top-level helper with the same name as a window-attached config object; because top-level `function foo(){…}` declarations in classic (non-module) scripts attach to `window`, boot.js's `window._inflightStateLimits = {…}` assignment overwrote the function reference before any session could send. Every new chat broke on first `send()` with `TypeError: _inflightStateLimits is not a function`, leaving v0.51.117 effectively unusable. Renamed the function only (the public-ish window key is unchanged) and updated all 4 call sites. **New regression test `tests/test_window_function_collision.py` scans every static JS file for top-level `function NAME()` declarations whose name is also the target of `window.NAME = {…}` / `= <number>`, the exact shape that broke #2715 (`_pinnedSessionsLimit` in v0.51.106) and #2771 (`_inflightStateLimits` in v0.51.117). The test fails loudly with a precise file:name diagnostic if the bug class returns. Verified end-to-end against the live browser before merge: `_getInflightStateLimits()` returns the limits object and `saveInflightState()` persists to localStorage without throwing.
+
+## [v0.51.117] — 2026-05-22 — Release CO (stage-pr2766 — 1-PR — in-flight recovery storage quota-safe)
+
+### Fixed
+
+- **PR #2766** by @george-andraws — Make in-flight recovery storage quota-safe so a full browser `localStorage` budget no longer blocks chat submission with `QuotaExceededError: Failed to execute 'setItem' on 'Storage': Setting the value of 'hermes-webui-inflight' exceeded the quota.` The fix has four parts: (1) compact recovery snapshots before writing to keep only recent messages, tool calls, uploaded-file metadata, stream id, and updated timestamp; (2) truncate individual large strings per field (`60000` chars default) and prune the serialized payload (`1500000` chars default); (3) catch quota errors specifically on `markInflight()`, drop the larger `hermes-webui-inflight-state` key, then retry the tiny marker write; (4) expose 5 new configurable settings (`inflight_state_max_sessions`, `_max_messages`, `_max_tool_calls`, `_max_string_chars`, `_max_json_chars`) with int-range validation so operators can tune the budget. Self-healing on the very first chat submit after upgrade for users with already-quota-exhausted storage — no manual reload required. Graceful degradation if storage is still too full even after compaction (clears recovery snapshots but never blocks chat submit).
+
+## [v0.51.116] — 2026-05-22 — Release CN (stage-pr2676 — 1-PR — per-skill enable/disable toggle in Skills panel, CLI-parity with `hermes skills config`)
+
+### Added
+
+- **PR #2676** by @lucasrc — Each skill in the Skills panel now has a toggle pill (enabled/disabled) so users can turn individual skills on or off directly from the WebUI without editing `config.yaml`. Achieves parity with the existing `hermes skills config` CLI subcommand (interactive TUI that toggles `skills.disabled` in config). The disabled state is mirrored through to `skills.platform_disabled.webui` when that key is present. Disabled skills remain visible in the panel (muted via `opacity: .45`) instead of being filtered out, so users can re-enable them later. New endpoint: `POST /api/skills/toggle` validates the skill exists in the filesystem before mutating config, wraps the YAML read-modify-write under the existing `_cfg_lock` for thread safety, and calls `reload_config()` so the change takes effect immediately. Toggle pill uses theme variables (`--accent-bg-strong`, `--accent`, `--border`, `--muted`, `--accent-text`) so it adapts automatically to each skin: gold for default, red for ares, blue for poseidon, purple for sisyphus, grey for mono — verified empirically across light + dark variants. i18n keys (`skill_enabled`, `skill_disabled`, `skill_toggle_failed`) translated across all 10 locales. Default-state safety: fresh installs (no `skills.disabled` key in config) return `disabled: False` for every skill — no regression risk for new users.
+
+## [v0.51.115] — 2026-05-22 — Release CM (stage-pr2731 — 1-PR — clarify prompt collapse/expand with chevron-icon polish)
+
+### Added
+
+- **PR #2731** by @Michaelyklam — Clarification prompts now include a compact Collapse/Expand control so users can temporarily shrink a blocking decision card and reread the chat context behind it before responding. The toggle uses Lucide chevron icons (chevron-down expanded → click to collapse, chevron-up collapsed → click to expand) and a small circular pill matching the existing composer-button design language. The collapsed card sits cleanly above the composer at every tested viewport (desktop 1920×1080, mobile iPhone 14 390×844) without edge clipping. New clarification prompts still open expanded so users notice them.
+
+## [v0.51.114] — 2026-05-22 — Release CL (stage-407 — 1-PR — update-check recovery from remote re-tags)
+
+### Fixed
+
+- **PR #2758** by @nesquena-hermes — fix(updates): pass `--force` to `git fetch --tags` in `api/updates.py` so the WebUI's release-tracking update check can recover from a remote re-tag (e.g. a release tag that was force-pushed to a new commit after a squash-merge). Without `--force`, plain `git fetch origin --tags` returns `! [rejected] vX.Y.Z (would clobber existing tag)` and the entire update path (check, force-apply, normal-apply) jams indefinitely — neither the periodic check nor manual "Check now" nor the Update button can recover. Three fetch call sites were patched (`_check_repo`, `apply_force_update`, `apply_update`) to use `--tags --force`; the WebUI never pushes tags, so deferring to the remote's view is the right contract. Closes #2756.
+
+## [v0.51.113] — 2026-05-22 — Release CK (stage-406 — 1-PR — composer model picker lag fix + hard-refresh recovery)
+
+### Fixed
+
+- **PR #2743** by @franksong2702 — Composer model picker now opens immediately from the existing static option list while the dynamic `/api/models` catalog hydrates in the background, instead of blocking the click on the catalog request. A just-selected session model also survives a hard refresh that interrupts the async `/api/session/update` POST: the selection is staged into `sessionStorage` (keyed by session_id, 10-minute TTL) before the async update flies, and `loadSession()` re-applies the pending pick on next session restore and retries the persistence call. Tests pin the new ordering: visible picker render before `await`, pending-state save before `await api('/api/session/update')`, and pending-state replay before the first `syncTopbar()` projects server metadata.
+
+## [v0.51.112] — 2026-05-22 — Release CJ (stage-405 — 1-PR — session model authoritative across restore)
+
+### Fixed
+
+- **PR #2737** by @ai-ag2026 — Keep the session model authoritative when a restored session is reactivated. Previously, stale browser-cached picker state could override an active conversation's model in four scenarios: (1) on initial boot when `localStorage` had a different model preference than the active session, (2) on hard refresh when `S._bootReady` revealed the composer chip before the live catalog hydrated, (3) when the session's model wasn't in the current provider catalog (the static/default fallback silently rewrote `S.session.model`), (4) when starting a new session whose model wasn't in the static HTML dropdown. The fix: `loadSession()` now requests `resolve_model=1` so backend normalization happens synchronously with metadata; boot model hydration prefers the active session over `localStorage`; hard refresh re-runs the model dropdown hydration before `_bootReady`; a new `_ensureModelOptionInDropdown()` helper injects a `data-custom='1'` option for models not in the catalog instead of silently rewriting `S.session.model` to the default. 100 LOC of new pytest regression coverage pinning each behavior.
+
+## [v0.51.111] — 2026-05-22 — Release CI (stage-404 — 1-PR — keep state.db replays out of sidecar tail)
+
+### Fixed
+
+- **PR #2746** by @ai-ag2026 — Prevent replayed state.db rows from being appended after an already-correct sidecar transcript tail. `merge_session_messages_append_only()` previously tried to skip state.db rows replaying the sidecar, but two edge cases leaked through: (1) the final row of a replayed sidecar prefix was not skipped because the replay index had reached the sidecar sequence length, and (2) a replayed middle segment was not considered prefix replay, so old state.db rows could be appended after the saved assistant tail. That made `/api/session` appear to end on an old user prompt even when the saved sidecar already ended on the real assistant answer. The fix tracks per-(role, content) visible-occurrence counts in the sidecar and uses that as a replay budget when comparing state.db rows; legitimate repeated messages from state.db are still preserved. `_has_visible_duplicate()` is kept as a thin wrapper around the new `_matching_visible_duplicate()` for backwards compatibility. Regression test covers both full-replay and middle-segment replay shapes.
+
+## [v0.51.110] — 2026-05-22 — Release CH (stage-403 — 2-PR batch — default personality from config + sort configured providers to top)
+
+### Added
+
+- **PR #2747** by @s010mn — `new_session()` now reads `display.personality` from `config.yaml` as the default for new conversations. Previously every new session started with `personality=None` and required an explicit `/personality <name>` slash command. Values `'none'`, `'default'`, `'neutral'`, and empty string are treated as no-personality. Case-insensitive — `personality: Taleb` normalizes to `taleb`. Config-read is wrapped in try/except so malformed config falls back to the prior behavior rather than crashing session creation. The `/personality` slash command still works for per-session overrides.
+- **PR #2683** by @jasonjcwu — Sort providers so configured/custom entries appear first in both the model picker dropdown (`api/config.py::get_available_models`) and the Settings providers panel (`api/providers.py::get_providers`). Priority order: (1) the active provider, (2) `custom:*` providers from `custom_providers` config, (3) providers with configured API keys (credential pool or `config.yaml`), (4) all others alphabetical. Eliminates scrolling past 25+ unconfigured providers to find the one in active use.
+
+## [v0.51.109] — 2026-05-22 — Release CG (stage-402 — 2-PR batch — sidebar action menu click stability + chat panel sidebar resync after navigation)
+
+### Fixed
+
+- **PR #2741** by @ai-ag2026 — Keep the sidebar conversation actions menu open while session-list refreshes, stream updates, or panel-resync repairs arrive. Previously the three-dot menu beside chat titles could be torn down before the user finished clicking it because `renderSessionListFromCache()` rebuilt the row DOM (and the fixed-position menu's anchor) without checking whether the menu was open. The new early-return at the top of the refresh keeps the menu stable; destructive menu actions explicitly close the menu before they fire, so dismissal still works as expected.
+- **PR #2736** by @ai-ag2026 — Resync the chat sidebar after returning from Settings/Logs/other panels. The session list is virtualized, and the browser can clamp the preserved scrollTop during a panel transition; without a render after the chat view is visible again, stale virtual spacer/header DOM remained until the next manual scroll. The new `_resyncChatSidebarAfterPanelSwitch()` helper runs one guarded `requestAnimationFrame` after the panel becomes visible, bails if a rename input or action menu is open, and uses no polling.
+
+## [v0.51.108] — 2026-05-22 — Release CF (stage-401 — 4-PR batch — session-index dedup + update-check diagnostic redaction + handoff-summary sqlite connection leak fix + Slice 4d runner route gate docs)
+
+### Added
+
+- **PR #2744** by @Michaelyklam — #1925 RuntimeAdapter RFC follow-up: marks the `runner-local` selection seam shipped in v0.51.105 and defines the next Slice 4d supervised runner route gate before live chat can move onto a runner backend. The gate keeps runner routing default-off, preserves legacy fallback and public response shapes, and carries the Runtime API gap matrix forward so active-run discovery, session→run lookup, command metadata, artifacts, and provider/tool routing do not become private WebUI runtime replicas.
+
+### Fixed
+
+- **PR #2738** by @weidzhou — `_write_session_index()` full-rebuild path now deduplicates entries by `session_id`. When old-format `session_*.json` files coexist with WebUI-format `xxx.json` files sharing the same `session_id`, the index produced duplicate Vue `:key` entries and crashed the frontend with a blank page. The lazy rebuild now uses `dict[session_id → compact_entry]` keyed on session_id, with the higher `message_count` entry winning on conflict.
+- **PR #2730** by @ashbuildslife — Sanitize git fetch diagnostics before returning update-check errors to the browser. New `_sanitize_git_diagnostic()` in `api/updates.py` strips credentialed URL userinfo (`user:token@host`), GitHub token shapes (`ghp_*`, `gho_*`, `github_pat_*`), and secret-looking query parameters (`?access_token=`, `?token=`, `?password=`, `?auth=`, `?key=`), then caps the message at 300 characters. Empirically verified that plain `https://github.com/owner/repo.git` URLs and SSH-style `git@host:owner/repo` remotes pass through untouched — only credentialed shapes are redacted. Update-check failure context (e.g. `Authentication failed`, network errors) is preserved.
+- **PR #2742** by @Isla-Liu — Per-turn SQLite connection leak in handoff-summary path (#2233). Two functions on the `/api/session/handoff-summary` hot path were opening `sqlite3.connect(...)` inside a bare `with` statement, which commits the transaction at scope exit but does NOT close the connection. Per-turn invocations accumulated `state.db`/`state.db-wal` file descriptors and CPython heap pages on long-lived worker threads, surfacing as multi-GB VmRSS / 6× duplicated state.db fds on long-running installs. Wrapped both call sites with `contextlib.closing(...)` (already imported and used at 7 other sites in the same files) so the connection is closed deterministically: `api/models.py::count_conversation_rounds` and `api/routes.py::_persist_handoff_summary_to_state_db`. Regression test loops both functions 20× against a tmp `state.db` and asserts `/proc/<pid>/fd` count does not grow more than 2. Live soak: fd growth = 0, VmRSS growth = 0 KB across 20 POSTs.
 
 ## [v0.51.107] — 2026-05-21 — Release CE (stage-400 — 8-PR batch — pinned-sessions-limit getter rename + uploaded-file user-turn dedupe + active-run repair guard + incremental KaTeX streaming + profile default model on fresh boot + French locale completion + update-check error surfacing + release-update apply path)
 
@@ -16,6 +89,7 @@
 - **PR #2722** by @victorwhale — Complete French (`fr`) locale coverage: +93 missing translation keys covering Settings, profile-ops, gateway tile, skills modal, session controls, and i18n test surfaces. Coverage 88.8% → 96.7%.
 - **PR #2717** by @ai-ag2026 — Surface update-check fetch errors in the UI instead of failing silently. The background `api/updates/check` request previously swallowed network failures, so an offline / blocked-CDN scenario showed no indication that the version banner couldn't render. Now the failure is logged and exposed to the System panel's update-status card.
 - **PR #2719** by @ai-ag2026 — Apply release-update target correctly when the user clicks "Check for updates" after a prior dismissal: clears the `sessionStorage` check-once stamp and forces banner re-evaluation. The prior path silently no-op'd because the once-per-tab guard fired before the explicit user click could re-trigger the fetch.
+
 
 ## [v0.51.106] — 2026-05-21 — Release CD (stage-399 — 3-PR batch — restamped state.db replay dedupe + context_messages dedupe so agent doesn't see duplicates + empty _partial bloat fix)
 

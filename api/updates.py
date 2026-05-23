@@ -36,6 +36,28 @@ _cache_lock = threading.Lock()
 _check_in_progress = False
 _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same repo
 CACHE_TTL = 1800  # 30 minutes
+_GIT_DIAGNOSTIC_MAX_CHARS = 300
+_CREDENTIAL_IN_URL_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s'\"]+)@")
+_GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
+_QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|token|password|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CHARS) -> str:
+    """Return a user-facing git diagnostic with credentials removed.
+
+    Git can echo remote URLs in failure output.  Keep the actionable error text,
+    but strip URL userinfo, common GitHub token shapes, and secret-looking query
+    parameter values before any message reaches the update-check API/UI.
+    """
+    if not output:
+        return ""
+    sanitized = _CREDENTIAL_IN_URL_RE.sub(r"\1<redacted>@", str(output))
+    sanitized = _GITHUB_TOKEN_RE.sub("<redacted>", sanitized)
+    sanitized = _QUERY_SECRET_RE.sub(r"\1<redacted>", sanitized)
+    sanitized = sanitized.strip()
+    if len(sanitized) > limit:
+        sanitized = sanitized[:limit].rstrip() + "…"
+    return sanitized
 
 
 def _active_stream_count() -> int:
@@ -455,12 +477,19 @@ def _check_repo(path, name):
 
     # Fetch tags first so update prompts track published releases, not every
     # development commit that lands on master/main after the latest release.
-    fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--tags'], path, timeout=15)
+    #
+    # --force is required because the WebUI is a release-tracking consumer:
+    # it never pushes tags, so it should always defer to whatever the remote
+    # says a release tag points to. Without --force, a remote re-tag (e.g.
+    # after a squash-merge that re-points a release tag at a new SHA) jams
+    # the update path indefinitely with "would clobber existing tag" errors.
+    # See #2756.
+    fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--tags', '--force'], path, timeout=15)
     if not fetch_ok:
         release_info = _check_repo_release(path, name)
         message = 'fetch failed'
         if fetch_out:
-            message = f'{message}: {fetch_out}'
+            message = f'{message}: {_sanitize_git_diagnostic(fetch_out)}'
         if release_info is not None:
             release_info = dict(release_info)
             release_info['error'] = message
@@ -874,7 +903,10 @@ def apply_force_update(target: str) -> dict:
         if path is None or not (path / '.git').exists():
             return {'ok': False, 'message': 'Not a git repository'}
 
-        _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags'], path, timeout=15)
+        # --force so a remote re-tag (e.g. squash-merge that re-points an
+        # existing release tag) doesn't jam the apply path with "would clobber
+        # existing tag". See #2756.
+        _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
         if not fetch_ok:
             return {
                 'ok': False,
@@ -931,7 +963,8 @@ def _apply_update_inner(target):
         return {'ok': False, 'message': 'Not a git repository'}
 
     # Fetch before attempting pull, so the remote ref is current.
-    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags'], path, timeout=15)
+    # --force so a remote re-tag doesn't block the update path (see #2756).
+    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
     if not fetch_ok:
         return {
             'ok': False,

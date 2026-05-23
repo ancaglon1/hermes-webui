@@ -110,19 +110,30 @@ def _write_session_index(updates=None):
         # Lazy full-rebuild path — used when index doesn't exist yet.
         if updates is None or not SESSION_INDEX_FILE.exists():
             _cleanup_stale_tmp_files()  # best-effort sweep on startup / first call
-            entries = []
+            entry_map: dict[str, dict] = {}
             for p in SESSION_DIR.glob('*.json'):
                 if p.name.startswith('_'):
                     continue
                 try:
                     s = Session.load(p.stem)
                     if s:
-                        entries.append(s.compact())
+                        c = s.compact()
+                        sid = c.get('session_id')
+                        if sid:
+                            # Dedup by session_id: prefer entry with more messages
+                            # (handles old-format session_xxx.json files alongside
+                            #  WebUI-format xxx.json with the same session_id)
+                            existing = entry_map.get(sid)
+                            if existing is None or (
+                                c.get('message_count', 0) > existing.get('message_count', 0)
+                            ):
+                                entry_map[sid] = c
                 except Exception:
                     logger.debug("Failed to load session from %s", p)
+            entries = list(entry_map.values())
 
             with LOCK:
-                existing_ids = {e.get('session_id') for e in entries}
+                existing_ids = set(entry_map.keys())
                 for s in SESSIONS.values():
                     if s.session_id not in existing_ids:
                         entries.append(s.compact())
@@ -1837,6 +1848,19 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         effective_model, effective_model_provider = _profile_default_model_state(profile)
         if model_provider:
             effective_model_provider = model_provider
+
+    # Read default personality from config display.personality
+    _default_personality = None
+    try:
+        from api.config import get_config as _get_cfg_for_personality
+        _cfg_personality = (_get_cfg_for_personality().get('display') or {}).get('personality')
+        if _cfg_personality and isinstance(_cfg_personality, str):
+            _cfg_personality = _cfg_personality.strip().lower()
+            if _cfg_personality and _cfg_personality not in ('default', 'none', 'neutral'):
+                _default_personality = _cfg_personality
+    except Exception:
+        pass
+
     wt = worktree_info if isinstance(worktree_info, dict) else None
     workspace_path = (wt.get('path') if wt and wt.get('path') else workspace) if wt else workspace
     s = Session(
@@ -1845,6 +1869,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         model_provider=effective_model_provider,
         profile=profile,
         project_id=project_id,
+        personality=_default_personality,
         worktree_path=wt.get('path') if wt else None,
         worktree_branch=wt.get('branch') if wt else None,
         worktree_repo_root=wt.get('repo_root') if wt else None,
@@ -3023,24 +3048,28 @@ def _session_message_visible_key(msg: dict):
     )
 
 
-def _has_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]) -> bool:
+def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]):
     if visible_key in visible_keys:
-        return True
+        return visible_key
     role, content = visible_key
     if not content:
-        return False
+        return None
     for existing_role, existing_content in visible_keys:
         if role != existing_role or not existing_content:
             continue
         if content in existing_content or existing_content in content:
-            return True
+            return (existing_role, existing_content)
         loose_content = _loose_session_message_content(content)
         loose_existing = _loose_session_message_content(existing_content)
         if loose_content and loose_existing and (
             loose_content in loose_existing or loose_existing in loose_content
         ):
-            return True
-    return False
+            return (existing_role, existing_content)
+    return None
+
+
+def _has_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]) -> bool:
+    return _matching_visible_duplicate(visible_key, visible_keys) is not None
 
 
 def merge_session_messages_append_only(sidecar_messages: list, state_messages: list) -> list:
@@ -3057,6 +3086,8 @@ def merge_session_messages_append_only(sidecar_messages: list, state_messages: l
     seen_content_keys = set()
     seen_visible_keys = set()
     sidecar_visible_sequence = []
+    sidecar_visible_keys = set()
+    sidecar_visible_counts = {}
     max_sidecar_timestamp = None
     for msg in sidecar_messages:
         timestamp = _message_timestamp_as_float(msg)
@@ -3067,9 +3098,12 @@ def merge_session_messages_append_only(sidecar_messages: list, state_messages: l
         seen_content_keys.add(_session_message_content_key(msg))
         visible_key = _session_message_visible_key(msg)
         seen_visible_keys.add(visible_key)
+        sidecar_visible_keys.add(visible_key)
+        sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
         sidecar_visible_sequence.append(visible_key)
         merged_messages.append(msg)
     state_replay_idx = 0
+    skipped_state_visible_counts = {}
     for msg in state_messages:
         timestamp = _message_timestamp_as_float(msg)
         key = _session_message_merge_key(msg)
@@ -3082,7 +3116,12 @@ def merge_session_messages_append_only(sidecar_messages: list, state_messages: l
             ):
                 replays_sidecar_prefix = True
                 state_replay_idx += 1
-        if replays_sidecar_prefix and state_replay_idx < len(sidecar_visible_sequence):
+        if replays_sidecar_prefix:
+            matched_visible_key = _matching_visible_duplicate(visible_key, sidecar_visible_keys)
+            if matched_visible_key is not None:
+                skipped_state_visible_counts[matched_visible_key] = (
+                    skipped_state_visible_counts.get(matched_visible_key, 0) + 1
+                )
             continue
         if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
             if key in seen_message_keys:
@@ -3091,6 +3130,13 @@ def merge_session_messages_append_only(sidecar_messages: list, state_messages: l
                 continue
         if key in seen_message_keys:
             continue
+        matched_visible_key = _matching_visible_duplicate(visible_key, sidecar_visible_keys)
+        if matched_visible_key is not None:
+            skipped_count = skipped_state_visible_counts.get(matched_visible_key, 0)
+            sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
+            if skipped_count < sidecar_count:
+                skipped_state_visible_counts[matched_visible_key] = skipped_count + 1
+                continue
         # State rows at or before the newest sidecar timestamp are normally
         # assumed to have already been observed by the sidecar. The <= gate
         # preserves sidecar-only ordering/metadata for equal timestamps and
@@ -3180,7 +3226,7 @@ def count_conversation_rounds(sid: str, since: float | None = None) -> int:
         return 0
 
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing(sqlite3.connect(str(db_path))) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(

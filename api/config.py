@@ -4003,6 +4003,36 @@ def get_available_models() -> dict:
             or (g.get("provider_id") or "").startswith("custom:")
         ]
 
+        # Sort groups: active provider first, then custom:* providers,
+        # then providers with configured keys, then the rest alphabetically.
+        _providers_with_keys: set[str] = set()
+        try:
+            _pool = auth_store.get("credential_pool", {}) if isinstance(auth_store, dict) else {}
+            if isinstance(_pool, dict):
+                for _pid in _pool:
+                    _providers_with_keys.add(_resolve_provider_alias(str(_pid)))
+        except Exception:
+            pass
+        try:
+            _cfg_providers = cfg.get("providers", {})
+            if isinstance(_cfg_providers, dict):
+                for _pk, _pv in _cfg_providers.items():
+                    if isinstance(_pv, dict) and (_pv.get("api_key") or _pv.get("key_env")):
+                        _providers_with_keys.add(_resolve_provider_alias(str(_pk)))
+        except Exception:
+            pass
+
+        def _group_sort_key(g):
+            pid = g.get("provider_id") or ""
+            if pid == active_provider:
+                return (0, pid)
+            if pid.startswith("custom:"):
+                return (1, pid)
+            if pid in _providers_with_keys:
+                return (2, pid)
+            return (3, pid)
+        groups.sort(key=_group_sort_key)
+
         # 12. Include model aliases so the WebUI frontend can resolve them.
         model_aliases: dict[str, str] = {}
         try:
@@ -4325,6 +4355,11 @@ _SETTINGS_DEFAULTS = {
     "session_jump_buttons": False,  # show Start/End transcript jump pills
     "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
     "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
+    "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
+    "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
+    "inflight_state_max_tool_calls": 48,  # max recent tool-call records kept per recovery snapshot
+    "inflight_state_max_string_chars": 60000,  # max string length kept inside a recovery snapshot field
+    "inflight_state_max_json_chars": 1500000,  # max serialized recovery snapshot payload before pruning
     "hidden_tabs": [],  # sidebar tab panel names hidden by user (e.g. ["tasks","kanban"]); chat and settings are always visible
     "language": "en",  # UI locale code; must match a key in static/i18n.js LOCALES
     "bot_name": os.getenv(
@@ -4455,6 +4490,11 @@ _SETTINGS_ENUM_VALUES = {
 }
 _SETTINGS_INT_RANGES = {
     "pinned_sessions_limit": (1, 99),
+    "inflight_state_max_sessions": (1, 25),
+    "inflight_state_max_messages": (1, 100),
+    "inflight_state_max_tool_calls": (1, 200),
+    "inflight_state_max_string_chars": (1000, 500000),
+    "inflight_state_max_json_chars": (100000, 4000000),
 }
 _SETTINGS_BOOL_KEYS = {
     "onboarding_completed",
