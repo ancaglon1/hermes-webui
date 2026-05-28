@@ -167,6 +167,7 @@ const LOCALES = {
     model_unavailable_title: 'This model is no longer in your current provider list',
     provider_mismatch_warning: (m,p)=>`"${m}" may not work with your configured provider (${p}). Send anyway, or run \`hermes model\` in your terminal to switch.`,
     provider_mismatch_label: 'Provider mismatch',
+    gateway_auth_label: 'Gateway authentication failed',
     model_not_found_label: 'Model not found',
     model_custom_label: 'Custom model ID',
     model_custom_placeholder: 'e.g. openai/gpt-5.4',
@@ -184,6 +185,7 @@ const LOCALES = {
     model_scope_toast: 'Applies to this conversation from your next message.',
     // commands.js
     cmd_clear: 'Clear conversation messages',
+    cmd_help: 'Show available slash commands',
     cmd_compress: 'Manually compress conversation context (usage: /compress [focus topic])',
     ctx_compress_hint: 'Compress context to free up space →',
     ctx_compress_action: '⚠ Compress now to free context',
@@ -398,6 +400,7 @@ const LOCALES = {
     file_open_failed: 'Could not open file',
     downloading: (name) => `Downloading ${name}\u2026`,
     double_click_rename: 'Double-click to rename',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Renamed to ',
     rename_failed: 'Rename failed: ',
     delete_title: 'Delete',
@@ -774,6 +777,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',
+    insights_skill_usage_title: 'Skill Usage',
+    insights_skill_usage_sub: 'Tool invocation frequency',
+    insights_skill_usage_total: 'Total invocations',
+    insights_skill_usage_skills_used: 'Skills used',
+    insights_skill_usage_no_data: 'No skill usage data yet',
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',
+    insights_skill_usage_col_uses: 'Uses',
+    insights_skill_usage_col_views: 'Views',
+    insights_skill_usage_col_share: 'Usage %',
+    insights_skill_usage_col_patches: 'Patches',
     workspace_desc: 'Add and switch workspaces for your sessions.',
     session_meta_messages: (n) => `${n} msg${n === 1 ? '' : 's'}`,
     session_meta_children: (n) => `${n} child${n === 1 ? '' : 'ren'}`,
@@ -857,6 +872,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configured via config.yaml. To update, edit the providers section in your config.yaml or run hermes auth.',
     providers_oauth_not_configured_hint: 'Not authenticated. Run hermes auth in the terminal to configure this provider.',
     providers_save: 'Save',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Remove',
     providers_saving: 'Saving…',
     providers_removing: 'Removing…',
@@ -1020,6 +1038,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'Error: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'N/A',
     never: 'never',
     add: 'Add',
@@ -1058,6 +1078,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Collapse prompt',
     cron_expand_output: 'Expand output',
     cron_collapse_output: 'Collapse output',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'All runs',
     cron_hide_runs: 'Hide runs',
     cron_no_runs_yet: '(no runs yet)',
@@ -1206,6 +1227,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Deliver output to',
     cron_deliver_local: 'Local (save output only)',
+    cron_deliver_custom: 'Custom delivery target',
     cron_profile_label: 'Profile',
     cron_profile_server_default: 'server default',
     cron_profile_server_default_hint: 'Uses the WebUI server default profile at run time. Existing jobs without a profile keep this legacy behavior.',
@@ -1446,6 +1468,7 @@ const LOCALES = {
     model_unavailable_title: 'Questo modello non è più nella lista provider attuale',
     provider_mismatch_warning: (m,p)=>`"${m}" potrebbe non funzionare con il provider configurato (${p}). Invia comunque, o esegui \`hermes model\` nel terminale per cambiare.`,
     provider_mismatch_label: 'Provider non corrispondente',
+    gateway_auth_label: 'Autenticazione Gateway non riuscita',
     model_not_found_label: 'Modello non trovato',
     model_custom_label: 'ID modello personalizzato',
     model_custom_placeholder: 'es. openai/gpt-5.4',
@@ -1463,6 +1486,7 @@ const LOCALES = {
     model_scope_toast: 'Si applica a questa conversazione dal prossimo messaggio.',
     // commands.js
     cmd_clear: 'Cancella i messaggi della conversazione',
+    cmd_help: 'Show available slash commands',
     cmd_compress: 'Comprimi manualmente il contesto della conversazione (uso: /compress [argomento])',
     ctx_compress_hint: 'Comprimi il contesto per liberare spazio →',
     ctx_compress_action: '⚠ Comprimi ora per liberare contesto',
@@ -1677,6 +1701,7 @@ const LOCALES = {
     file_open_failed: 'Impossibile aprire il file',
     downloading: (name) => `Scaricamento ${name}\u2026`,
     double_click_rename: 'Doppio clic per rinominare',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Rinominato in ',
     rename_failed: 'Rinomina fallita: ',
     delete_title: 'Elimina',
@@ -2048,6 +2073,18 @@ const LOCALES = {
     insights_model_share: 'Quota',
     insights_no_usage_data: 'Nessun dato di utilizzo',
     insights_footer: 'Dati mostrati dagli ultimi {days} giorni',
+    insights_skill_usage_title: 'Utilizzo Skill',
+    insights_skill_usage_sub: 'Frequenza di invocazione strumenti',
+    insights_skill_usage_total: 'Invocazioni totali',
+    insights_skill_usage_skills_used: 'Skill usate',
+    insights_skill_usage_no_data: 'Nessun dato di utilizzo skill ancora',
+    insights_skill_usage_no_data_hint: 'Le skill appariranno qui dopo essere state usate nelle conversazioni.',
+    insights_skill_usage_footer: 'Conteggi da ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Abilità',
+    insights_skill_usage_col_uses: 'Usi',
+    insights_skill_usage_col_views: 'Visualizzazioni',
+    insights_skill_usage_col_share: 'Utilizzo %',
+    insights_skill_usage_col_patches: 'Patch',
     workspace_desc: 'Aggiungi e cambia workspace per le tue sessioni.',
     session_meta_messages: (n) => `${n} msg`,
     session_meta_children: (n) => `${n} figli${n === 1 ? 'o' : ''}`,
@@ -2128,6 +2165,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configurato via config.yaml. Per aggiornare, modifica la sezione providers in config.yaml o esegui hermes auth.',
     providers_oauth_not_configured_hint: 'Non autenticato. Esegui hermes auth nel terminale per configurare questo provider.',
     providers_save: 'Salva',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Rimuovi',
     providers_saving: 'Salvataggio…',
     providers_removing: 'Rimozione…',
@@ -2291,6 +2331,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'Errore: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'N/D',
     never: 'mai',
     add: 'Aggiungi',
@@ -2329,6 +2371,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Comprimi prompt',
     cron_expand_output: 'Espandi output',
     cron_collapse_output: 'Comprimi output',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'Tutte le esecuzioni',
     cron_hide_runs: 'Nascondi esecuzioni',
     cron_no_runs_yet: '(nessuna esecuzione)',
@@ -2477,6 +2520,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Recapita output a',
     cron_deliver_local: 'Locale (solo salva output)',
+    cron_deliver_custom: 'Destinazione personalizzata',
     cron_profile_label: 'Profilo',
     cron_profile_server_default: 'predefinito server',
     cron_profile_server_default_hint: 'Usa il profilo predefinito del server WebUI a runtime. I job esistenti senza profilo mantengono questo comportamento legacy.',
@@ -2717,6 +2761,7 @@ const LOCALES = {
     model_unavailable_title: 'このモデルは現在のプロバイダ一覧に含まれていません',
     provider_mismatch_warning: (m,p)=>`"${m}" は設定されたプロバイダ (${p}) で動作しない可能性があります。このまま送信するか、ターミナルで \`hermes model\` を実行して切り替えてください。`,
     provider_mismatch_label: 'プロバイダ不一致',
+    gateway_auth_label: 'ゲートウェイ認証に失敗しました',
     model_not_found_label: 'モデルが見つかりません',
     model_custom_label: 'カスタムモデルID',
     model_custom_placeholder: '例: openai/gpt-5.4',
@@ -2734,6 +2779,7 @@ const LOCALES = {
     model_scope_toast: '次回のメッセージからこの会話に適用されます。',
     // commands.js
     cmd_clear: '会話メッセージをクリア',
+    cmd_help: 'Show available slash commands',
     cmd_compress: '会話コンテキストを手動で圧縮 (使い方: /compress [トピック])',
     ctx_compress_hint: 'コンテキストを圧縮して空きを確保 →',
     ctx_compress_action: '⚠ 今すぐ圧縮してコンテキストを確保',
@@ -2948,6 +2994,7 @@ const LOCALES = {
     file_open_failed: 'ファイルを開けませんでした',
     downloading: (name) => `${name} をダウンロード中…`,
     double_click_rename: 'ダブルクリックで名前変更',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: '名前を変更: ',
     rename_failed: '名前変更失敗: ',
     delete_title: '削除',
@@ -3324,6 +3371,18 @@ const LOCALES = {
     insights_model_share: 'シェア',
     insights_no_usage_data: '使用データはまだありません',
     insights_footer: '直近 {days} 日間のデータを表示',
+    insights_skill_usage_title: 'スキル使用状況',
+    insights_skill_usage_sub: 'ツール呼び出し頻度',
+    insights_skill_usage_total: '総呼び出し数',
+    insights_skill_usage_skills_used: '使用スキル数',
+    insights_skill_usage_no_data: 'スキル使用データがまだありません',
+    insights_skill_usage_no_data_hint: '会話でスキルを使用すると、ここに表示されます。',
+    insights_skill_usage_footer: 'データ元: ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'スキル',
+    insights_skill_usage_col_uses: '使用回数',
+    insights_skill_usage_col_views: '閲覧数',
+    insights_skill_usage_col_share: '使用率',
+    insights_skill_usage_col_patches: 'パッチ',
     workspace_desc: 'セッション用のワークスペースを追加・切り替えします。',
     session_meta_messages: (n) => `${n} 件`,
     session_meta_children: (n) => `${n} 子`,
@@ -3404,6 +3463,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'config.yaml でトークンが設定されています。更新するには config.yaml の providers セクションを編集するか hermes auth を実行してください。',
     providers_oauth_not_configured_hint: '未認証です。ターミナルで hermes auth を実行してこのプロバイダを設定してください。',
     providers_save: '保存',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: '削除',
     providers_saving: '保存中…',
     providers_removing: '削除中…',
@@ -3567,6 +3629,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'エラー: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'N/A',
     never: 'なし',
     add: '追加',
@@ -3605,6 +3669,7 @@ const LOCALES = {
     cron_collapse_prompt: 'プロンプトを折りたたむ',
     cron_expand_output: '出力を展開',
     cron_collapse_output: '出力を折りたたむ',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'すべての実行',
     cron_hide_runs: '実行履歴を隠す',
     cron_no_runs_yet: '(まだ実行されていません)',
@@ -3753,6 +3818,7 @@ const LOCALES = {
     cron_prompt_label: 'プロンプト',
     cron_deliver_label: '出力先',
     cron_deliver_local: 'ローカル (出力を保存のみ)',
+    cron_deliver_custom: 'カスタム配信先',
     cron_profile_label: 'プロフィール',
     cron_profile_server_default: 'サーバーデフォルト',
     cron_profile_server_default_hint: '実行時に WebUI サーバーのデフォルトプロフィールを使用します。プロフィールのない既存ジョブはこの従来の動作を維持します。',
@@ -3972,6 +4038,7 @@ const LOCALES = {
     provider_mismatch_warning: (m, p) =>
     `"${m}" может не работать с вашим настроенным провайдером (${p}). Всё равно отправить или запустите \`hermes model\` в терминале, чтобы переключиться.`,
     provider_mismatch_label: 'Несовпадение провайдера',
+    gateway_auth_label: 'Сбой аутентификации Gateway',
     model_not_found_label: 'Модель не найдена',
     model_custom_label: 'Пользовательский ID модели',
     model_custom_placeholder: 'например, openai/gpt-5.4',
@@ -4145,6 +4212,7 @@ const LOCALES = {
     file_open_failed: 'Не удалось открыть файл',
     downloading: (name) => `Скачиваю ${name}…`,
     double_click_rename: 'Дважды щёлкните, чтобы переименовать',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Переименовано в ',
     rename_failed: 'Не удалось переименовать: ',
     delete_title: 'Удалить',
@@ -4430,6 +4498,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configured via config.yaml. To update, edit the providers section in your config.yaml or run hermes auth.',
     providers_oauth_not_configured_hint: 'Not authenticated. Run hermes auth in the terminal to configure this provider.',
     providers_save: 'Save',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Remove',
     providers_saving: 'Saving…',
     providers_removing: 'Removing…',
@@ -4589,6 +4660,8 @@ const LOCALES = {
     onboarding_error_model_required: 'Модель обязательна.',
     onboarding_complete: 'Первичная настройка завершена',
     error_prefix: 'Ошибка: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'н/д',
     never: 'никогда',
     add: 'Добавить',
@@ -4627,6 +4700,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Свернуть промпт',
     cron_expand_output: 'Развернуть вывод',
     cron_collapse_output: 'Свернуть вывод',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'Все запуски',
     cron_hide_runs: 'Скрыть запуски',
     cron_no_runs_yet: '(пока запусков нет)',
@@ -4793,6 +4867,7 @@ const LOCALES = {
     cron_prompt_label: 'Запрос',
     cron_deliver_label: 'Доставлять вывод',
     cron_deliver_local: 'Локально (только сохранение)',
+    cron_deliver_custom: 'Пользовательская доставка',
     cron_profile_label: 'Профиль',
     cron_profile_server_default: 'по умолчанию сервера',
     cron_profile_server_default_hint: 'Использует профиль WebUI-сервера по умолчанию во время запуска. Существующие задания без профиля сохраняют это поведение.',
@@ -5028,6 +5103,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -5183,6 +5270,7 @@ const LOCALES = {
     model_unavailable_title: 'Este modelo ya no está en tu lista actual de proveedores',
     provider_mismatch_warning: (m,p)=>`"${m}" puede no funcionar con tu proveedor configurado (${p}). Envía de todas formas, o ejecuta \`hermes model\` en la terminal para cambiar.`,
     provider_mismatch_label: 'Proveedor incompatible',
+    gateway_auth_label: 'Error de autenticación de Gateway',
     model_not_found_label: 'Modelo no encontrado',
     model_custom_label: 'ID de modelo personalizado',
     model_custom_placeholder: 'p. ej. openai/gpt-5.4',
@@ -5335,6 +5423,7 @@ const LOCALES = {
     file_open_failed: 'No se pudo abrir el archivo',
     downloading: (name) => `Descargando ${name}…`,
     double_click_rename: 'Haz doble clic para renombrar',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Renombrado a ',
     rename_failed: 'Error al renombrar: ',
     delete_title: 'Eliminar',
@@ -5641,6 +5730,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configured via config.yaml. To update, edit the providers section in your config.yaml or run hermes auth.',
     providers_oauth_not_configured_hint: 'Not authenticated. Run hermes auth in the terminal to configure this provider.',
     providers_save: 'Save',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Remove',
     providers_saving: 'Saving…',
     providers_removing: 'Removing…',
@@ -5804,6 +5896,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'Error: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'N/A',
     never: 'never',
     add: 'Add',
@@ -5842,6 +5936,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Collapse prompt',
     cron_expand_output: 'Expand output',
     cron_collapse_output: 'Collapse output',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'All runs',
     cron_hide_runs: 'Hide runs',
     cron_no_runs_yet: '(no runs yet)',
@@ -5990,6 +6085,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Entregar salida a',
     cron_deliver_local: 'Local (solo guardar salida)',
+    cron_deliver_custom: 'Destino personalizado',
     cron_profile_label: 'Perfil',
     cron_profile_server_default: 'predeterminado del servidor',
     cron_profile_server_default_hint: 'Usa el perfil predeterminado del servidor WebUI durante la ejecución. Los trabajos existentes sin perfil conservan este comportamiento heredado.',
@@ -6225,6 +6321,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -6391,6 +6499,7 @@ const LOCALES = {
     model_unavailable_title: 'Dieses Modell ist nicht mehr in Ihrer aktuellen Provider-Liste',
     provider_mismatch_warning: (m,p)=>`"${m}" funktioniert möglicherweise nicht mit Ihrem konfigurierten Provider (${p}). Trotzdem senden, oder \`hermes model\` im Terminal ausführen.`,
     provider_mismatch_label: 'Provider-Konflikt',
+    gateway_auth_label: 'Gateway-Authentifizierung fehlgeschlagen',
     model_not_found_label: 'Modell nicht gefunden',
     // commands.js
     cmd_help: 'Verfügbare Befehle auflisten',
@@ -6528,6 +6637,7 @@ const LOCALES = {
     file_open_failed: 'Datei konnte nicht geöffnet werden',
     downloading: (name) => `Lade ${name} herunter\u2026`,
     double_click_rename: 'Doppelklick zum Umbenennen',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Umbenannt in ',
     rename_failed: 'Umbenennen fehlgeschlagen: ',
     delete_title: 'Löschen',
@@ -6824,6 +6934,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configured via config.yaml. To update, edit the providers section in your config.yaml or run hermes auth.',
     providers_oauth_not_configured_hint: 'Not authenticated. Run hermes auth in the terminal to configure this provider.',
     providers_save: 'Save',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Remove',
     providers_saving: 'Saving…',
     providers_removing: 'Removing…',
@@ -6903,6 +7016,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Ausgabe senden an',
     cron_deliver_local: 'Lokal (nur speichern)',
+    cron_deliver_custom: 'Benutzerdefiniertes Ziel',
     cron_profile_label: 'Profil',
     cron_profile_server_default: 'Serverstandard',
     cron_profile_server_default_hint: 'Verwendet zur Laufzeit das Standardprofil des WebUI-Servers. Bestehende Jobs ohne Profil behalten dieses Legacy-Verhalten.',
@@ -7207,6 +7321,8 @@ const LOCALES = {
     onboarding_error_model_required: 'Modell erforderlich.',
     onboarding_complete: 'Einrichtung abgeschlossen!',
     error_prefix: 'Fehler: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'Nicht verfügbar',
     never: 'Nie',
     add: 'Hinzufügen',
@@ -7244,6 +7360,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Prompt einklappen',
     cron_expand_output: 'Ausgabe erweitern',
     cron_collapse_output: 'Ausgabe einklappen',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'Alle Ausführungen',
     cron_hide_runs: 'Ausführungen ausblenden',
     cron_no_runs_yet: 'Noch keine Ausführungen.',
@@ -7437,6 +7554,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -7603,6 +7732,7 @@ const LOCALES = {
     model_unavailable_title: '这个模型已经不在当前 provider 列表中',
     provider_mismatch_warning: (m,p)=>`\"${m}\" 可能无法在当前配置的提供商 (${p}) 下工作。直接发送，或在终端运行 \`hermes model\` 切换。`,
     provider_mismatch_label: '提供商不匹配',
+    gateway_auth_label: 'Gateway 身份验证失败',
     model_not_found_label: '未找到模型',
     model_custom_label: '自定义模型 ID',
     model_custom_placeholder: '例如 openai/gpt-5.4',
@@ -7773,6 +7903,7 @@ const LOCALES = {
     file_open_failed: '无法打开文件',
     downloading: (name) => `正在下载 ${name}...`,
     double_click_rename: '双击重命名',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: '已重命名为 ',
     rename_failed: '重命名失败：',
     delete_title: '删除',
@@ -8051,6 +8182,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: '通过 config.yaml 配置的令牌。如需更新，请编辑 config.yaml 中的 providers 部分或运行 hermes auth。',
     providers_oauth_not_configured_hint: '未认证。在终端中运行 hermes auth 以配置此提供商。',
     providers_save: '保存',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: '移除',
     providers_saving: '保存中…',
     providers_removing: '移除中…',
@@ -8233,6 +8367,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: '错误：',
+    default: 'default',
+    search: 'Search',
     not_available: '无',
     never: '从未',
     add: '添加',
@@ -8271,6 +8407,7 @@ const LOCALES = {
     cron_collapse_prompt: '收起提示词',
     cron_expand_output: '展开输出',
     cron_collapse_output: '收起输出',
+    cron_view_full_output: 'View full output',
     cron_all_runs: '全部运行记录',
     cron_hide_runs: '隐藏记录',
     cron_no_runs_yet: '（暂无运行记录）',
@@ -8417,6 +8554,7 @@ const LOCALES = {
     cron_prompt_label: '提示词',
     cron_deliver_label: '输出位置',
     cron_deliver_local: '本地（仅保存输出）',
+    cron_deliver_custom: '自定义推送目标',
     cron_profile_label: '配置档',
     cron_profile_server_default: '服务器默认',
     cron_profile_server_default_hint: '运行时使用 WebUI 服务器默认配置档。没有配置档的现有作业会保留此旧行为。',
@@ -8642,6 +8780,18 @@ const LOCALES = {
     insights_model_share: '占比',
     insights_no_usage_data: '暂无使用数据',
     insights_footer: '显示最近 {days} 天的数据',
+    insights_skill_usage_title: '技能使用统计',
+    insights_skill_usage_sub: '工具调用频次',
+    insights_skill_usage_total: '总调用次数',
+    insights_skill_usage_skills_used: '已使用技能',
+    insights_skill_usage_no_data: '暂无技能使用数据',
+    insights_skill_usage_no_data_hint: '在对话中使用技能后，数据将在此显示。',
+    insights_skill_usage_footer: '数据来源于 ~/.hermes/skills/',
+    insights_skill_usage_col_skill: '技能',
+    insights_skill_usage_col_uses: '使用次数',
+    insights_skill_usage_col_views: '查看次数',
+    insights_skill_usage_col_share: '使用占比',
+    insights_skill_usage_col_patches: '补丁',
     insights_input_tokens: '输入',
     insights_messages: '消息',
     insights_models: '模型',
@@ -8799,6 +8949,7 @@ const LOCALES = {
     model_unavailable_title: '\u6b64\u6a21\u578b\u5df2\u7d93\u4e0d\u5728\u7576\u524d provider \u5217\u8868\u4e2d',
     provider_mismatch_warning: (m,p)=>`\"${m}\" \u53ef\u80fd\u7121\u6cd5\u5728\u7576\u524d\u914d\u7f6e\u7684\u63d0\u4f9b\u8005 (${p}) \u4e0b\u904b\u4f5c\u3002\u5c1a\u9001\uff0c\u6216\u5728\u7d42\u7aef\u57f7\u884c \`hermes model\` \u5207\u63db\u3002`,
     provider_mismatch_label: '\u63d0\u4f9b\u8005\u4e0d\u76f8\u7b26',
+    gateway_auth_label: 'Gateway 驗證失敗',
     model_not_found_label: '\u672a\u627e\u5230\u6a21\u578b',
     // commands.js
     cmd_help: '\u67e5\u770b\u53ef\u7528\u547d\u4ee4',
@@ -8887,6 +9038,7 @@ const LOCALES = {
     file_open_failed: '\u7121\u6cd5\u6253\u958b\u6587\u4ef6',
     downloading: (name) => `\u6b63\u5728\u4e0b\u8f09 ${name}...`,
     double_click_rename: '\u96d9\u64ca\u91cd\u547d\u540d',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: '\u5df2\u91cd\u547d\u540d\u70ba ',
     rename_failed: '\u91cd\u547d\u540d\u5931\u6557\uff1a',
     delete_title: '\u522a\u9664',
@@ -9457,6 +9609,8 @@ const LOCALES = {
     dismiss: '\u95dc\u9589',
     edit: '\u7de8\u8f2f',
     error_prefix: '\u932f\u8aa4\uff1a',
+    default: 'default',
+    search: 'Search',
     linked_files: '\u95dc\u806f\u6a94\u6848',
     manage_profiles: '\u7ba1\u7406\u8a2d\u5b9a\u6a94',
     memory_notes_label: '\u8a18\u61b6\uff08\u5099\u8a3b\uff09',
@@ -9658,6 +9812,7 @@ const LOCALES = {
     cron_collapse_prompt: '收起提示詞',
     cron_expand_output: '展開輸出',
     cron_collapse_output: '收起輸出',
+    cron_view_full_output: 'View full output',
     cron_next: '\u4e0b\u6b21',
     cron_no_jobs: '\u627e\u4e0d\u5230\u6392\u7a0b\u4efb\u52d9\u3002',
     cron_no_runs_yet: '\uff08\u5c1a\u7121\u57f7\u884c\u8a18\u9304\uff09',
@@ -9730,6 +9885,9 @@ const LOCALES = {
     providers_remove: '\u79fb\u9664',
     providers_removing: '\u79fb\u9664\u4e2d\u2026',
     providers_save: '\u5132\u5b58',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_saving: '\u5132\u5b58\u4e2d\u2026',
     providers_section_meta: '管理 AI 提供者的 API 金鑰。變更會立即生效。',
     providers_section_title: '供應商',
@@ -9841,6 +9999,7 @@ const LOCALES = {
     cron_prompt_label: '提示',
     cron_deliver_label: '發送至',
     cron_deliver_local: '僅本地儲存',
+    cron_deliver_custom: '自訂推送目標',
     cron_profile_label: '設定檔',
     cron_profile_server_default: '伺服器預設',
     cron_profile_server_default_hint: '執行時使用 WebUI 伺服器預設設定檔。沒有設定檔的既有工作會保留此舊行為。',
@@ -9928,6 +10087,18 @@ const LOCALES = {
     insights_model_share: 'Share',
     insights_no_usage_data: 'No usage data yet',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: '技能使用統計',
+    insights_skill_usage_sub: '工具調用頻次',
+    insights_skill_usage_total: '總調用次數',
+    insights_skill_usage_skills_used: '已使用技能',
+    insights_skill_usage_no_data: '暫無技能使用數據',
+    insights_skill_usage_no_data_hint: '在會話中使用技能後，數據將在此顯示。',
+    insights_skill_usage_footer: '數據來源於 ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -10028,6 +10199,7 @@ const LOCALES = {
     model_unavailable_title: 'Este modelo não está mais na sua lista de provedores',
     provider_mismatch_warning: (m,p)=>`"${m}" pode não funcionar com seu provedor configurado (${p}). Enviar assim mesmo, ou execute \`hermes model\` no terminal para trocar.`,
     provider_mismatch_label: 'Provedor incompatível',
+    gateway_auth_label: 'Falha na autenticação do Gateway',
     model_not_found_label: 'Modelo não encontrado',
     composer_mobile_workspace: 'Workspace',
     composer_mobile_model: 'Modelo',
@@ -10057,6 +10229,7 @@ const LOCALES = {
     session_worktree_badge: 'Worktree',
     // commands.js
     cmd_clear: 'Limpar mensagens da conversa',
+    cmd_help: 'Show available slash commands',
     cmd_compress: 'Comprimir manualmente o contexto (uso: /compress [tópico])',
     cmd_compact_alias: 'Alias legado para /compress',
     cmd_model: 'Trocar modelo (ex: /model gpt-4o)',
@@ -10240,6 +10413,7 @@ const LOCALES = {
     file_open_failed: 'Não foi possível abrir arquivo',
     downloading: (name) => `Baixando ${name}…`,
     double_click_rename: 'Duplo clique para renomear',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Renomeado para ',
     rename_failed: 'Falha ao renomear: ',
     delete_title: 'Excluir',
@@ -10641,6 +10815,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configurado via config.yaml. Para atualizar, edite config.yaml ou rode hermes auth.',
     providers_oauth_not_configured_hint: 'Não autenticado. Rode hermes auth no terminal.',
     providers_save: 'Salvar',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Remover',
     providers_saving: 'Salvando…',
     providers_removing: 'Removendo…',
@@ -10804,6 +10981,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'Erro: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'N/D',
     never: 'nunca',
     add: 'Adicionar',
@@ -10842,6 +11021,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Contraer prompt',
     cron_expand_output: 'Expandir saída',
     cron_collapse_output: 'Contraer saída',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'Todas execuções',
     cron_hide_runs: 'Esconder execuções',
     cron_no_runs_yet: '(sem execuções ainda)',
@@ -10919,6 +11099,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Entregar output para',
     cron_deliver_local: 'Local (salvar output apenas)',
+    cron_deliver_custom: 'Destino personalizado',
     cron_profile_label: 'Perfil',
     cron_profile_server_default: 'padrão do servidor',
     cron_profile_server_default_hint: 'Usa o perfil padrão do servidor WebUI no momento da execução. Tarefas existentes sem perfil mantêm esse comportamento legado.',
@@ -11015,6 +11196,18 @@ const LOCALES = {
     insights_activity_by_hour: 'Activity by Hour',  // TODO: translate
     insights_cost: 'Estimated Cost',  // TODO: translate
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -11184,6 +11377,7 @@ const LOCALES = {
     model_unavailable_title: 'This model is no longer in your current provider list',
     provider_mismatch_warning: (m,p)=>`"${m}" may not work with your configured provider (${p}). Send anyway, or run \`hermes model\` in your terminal to switch.`,
     provider_mismatch_label: 'Provider mismatch',
+    gateway_auth_label: 'Gateway 인증 실패',
     model_not_found_label: 'Model not found',
     model_custom_label: 'Custom model ID',
     model_custom_placeholder: 'e.g. openai/gpt-5.4',
@@ -11211,6 +11405,7 @@ const LOCALES = {
     model_scope_toast: '다음 메시지부터 이 대화에 적용됩니다.',
     // commands.js
     cmd_clear: '대화 메시지 지우기',
+    cmd_help: 'Show available slash commands',
     cmd_compress: 'Manually compress conversation context (usage: /compress [focus topic])',
     ctx_compress_hint: '\ucee8\ud14d\uc2a4\ud2b8 \uc555\ucd95\ud558\uba70 \uacf5\uac04 \ud655\ubcf4 →',
     ctx_compress_action: '\u26a0 \uc9c0\uae08 \uc555\ucd95\ud558\uba70 \ucee8\ud14d\uc2a4\ud2b8 \ud655\ubcf4',
@@ -11406,6 +11601,7 @@ const LOCALES = {
     file_open_failed: 'Could not open file',
     downloading: (name) => `Downloading ${name}\u2026`,
     double_click_rename: 'Double-click to rename',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Renamed to ',
     rename_failed: 'Rename failed: ',
     delete_title: '삭제',
@@ -11814,6 +12010,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Token configured via config.yaml. To update, edit the providers section in your config.yaml or run hermes auth.',
     providers_oauth_not_configured_hint: 'Not authenticated. Run hermes auth in the terminal to configure this provider.',
     providers_save: 'Save',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Remove',
     providers_saving: 'Saving…',
     providers_removing: 'Removing…',
@@ -11977,6 +12176,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'Error: ',
+    default: 'default',
+    search: 'Search',
     not_available: 'N/A',
     never: 'never',
     add: 'Add',
@@ -12015,6 +12216,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Collapse prompt',
     cron_expand_output: 'Expand output',
     cron_collapse_output: 'Collapse output',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'All runs',
     cron_hide_runs: 'Hide runs',
     cron_no_runs_yet: '(no runs yet)',
@@ -12163,6 +12365,7 @@ const LOCALES = {
     cron_prompt_label: 'Prompt',
     cron_deliver_label: 'Deliver output to',
     cron_deliver_local: 'Local (save output only)',
+    cron_deliver_custom: '사용자 지정 전달 대상',
     cron_profile_label: 'Profile',
     cron_profile_server_default: 'server default',
     cron_profile_server_default_hint: 'Uses the WebUI server default profile at run time. Existing jobs without a profile keep this legacy behavior.',
@@ -12279,6 +12482,18 @@ const LOCALES = {
     insights_model_share: '비율',
     insights_no_usage_data: '아직 사용 데이터가 없습니다',
     insights_footer: 'Showing data from the last {days} days',  // TODO: translate
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -12458,6 +12673,7 @@ const LOCALES = {
     model_unavailable: '(indisponible)',
     model_unavailable_title: 'Ce modèle ne figure plus dans votre liste de fournisseurs actuelle',
     provider_mismatch_label: 'Inadéquation des fournisseurs',
+    gateway_auth_label: 'Échec de l’authentification Gateway',
     model_not_found_label: 'Modèle introuvable',
     model_custom_label: 'ID de modèle personnalisé',
     model_custom_placeholder: 'par ex. openai/gpt-5.4',
@@ -12474,6 +12690,7 @@ const LOCALES = {
     model_scope_advisory: 'S\'applique à cette conversation à partir de votre prochain message.',
     model_scope_toast: 'S\'applique à cette conversation à partir de votre prochain message.',
     cmd_clear: 'Messages de conversation clairs',
+    cmd_help: 'Show available slash commands',
     cmd_compress: 'Compresser manuellement le contexte de conversation (utilisation : /compress [thème principal])',
     ctx_compress_hint: 'Compresser le contexte pour libérer de l\'espace →',
     ctx_compress_action: '⚠ Compressez maintenant pour libérer le contexte',
@@ -12608,6 +12825,7 @@ const LOCALES = {
     image_load_failed: 'Impossible de charger l\'image',
     file_open_failed: 'Impossible d\'ouvrir le fichier',
     double_click_rename: 'Double-cliquez pour renommer',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Renommé en',
     rename_failed: 'Échec du changement de nom :',
     delete_title: 'Supprimer',
@@ -12937,6 +13155,18 @@ const LOCALES = {
     insights_model_share: 'Partager',
     insights_no_usage_data: 'Aucune donnée d\'utilisation pour l\'instant',
     insights_footer: 'Affichage des données des {days} derniers jours',
+    insights_skill_usage_title: 'Utilisation des Skills',
+    insights_skill_usage_sub: 'Fréquence d\'invocation des outils',
+    insights_skill_usage_total: 'Invocations totales',
+    insights_skill_usage_skills_used: 'Skills utilisés',
+    insights_skill_usage_no_data: 'Aucune donnée d\'utilisation des skills pour le moment',
+    insights_skill_usage_no_data_hint: 'Les skills apparaîtront ici une fois utilisés dans les conversations.',
+    insights_skill_usage_footer: 'Comptages depuis ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     workspace_desc: 'Ajoutez et changez d\'espace de travail pour vos sessions.',
     session_lineage_segment_untitled: 'Segment sans titre',
     session_lineage_segment_open: 'Segment de lignée ouverte',
@@ -13010,6 +13240,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Jeton configuré via config.yaml. Pour mettre à jour, modifiez la section des fournisseurs dans votre config.yaml ou exécutez Hermes Auth.',
     providers_oauth_not_configured_hint: 'Non authentifié. Exécutez Hermes Auth dans le terminal pour configurer ce fournisseur.',
     providers_save: 'Sauvegarder',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Retirer',
     providers_saving: 'Économie…',
     providers_removing: 'Suppression…',
@@ -13169,6 +13402,8 @@ const LOCALES = {
     onboarding_error_model_required: 'Un modèle est requis.',
     onboarding_complete: 'Intégration terminée',
     error_prefix: 'Erreur:',
+    default: 'default',
+    search: 'Search',
     not_available: 'N / A',
     never: 'jamais',
     add: 'Ajouter',
@@ -13207,6 +13442,7 @@ const LOCALES = {
     cron_collapse_prompt: 'Réduire le prompt',
     cron_expand_output: 'Développer la sortie',
     cron_collapse_output: 'Réduire la sortie',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'Toutes les courses',
     cron_hide_runs: 'Masquer les courses',
     cron_no_runs_yet: '(pas encore de courses)',
@@ -13340,6 +13576,7 @@ const LOCALES = {
     cron_prompt_label: 'Rapide',
     cron_deliver_label: 'Livrer la sortie à',
     cron_deliver_local: 'Local (enregistrer la sortie uniquement)',
+    cron_deliver_custom: 'Destination personnalisee',
     cron_profile_label: 'Profil',
     cron_profile_server_default: 'serveur par défaut',
     cron_profile_server_default_hint: 'Utilise le profil par défaut du serveur WebUI au moment de l\'exécution. Les tâches existantes sans profil conservent ce comportement hérité.',
@@ -13663,6 +13900,7 @@ const LOCALES = {
     model_unavailable_title: 'Bu model artık mevcut sağlayıcı listenizde değil',
     provider_mismatch_warning: (m,p) => `"${m}" yapılandırılmış sağlayıcınızla (${p}) çalışmayabilir. Yine de gönderin veya geçiş yapmak için terminalinizde \`hermes model\` komutunu çalıştırın.`,
     provider_mismatch_label: 'Sağlayıcı uyumsuzluğu',
+    gateway_auth_label: 'Gateway kimlik doğrulaması başarısız',
     model_not_found_label: 'Model bulunamadı',
     model_custom_label: 'Özel model kimliği',
     model_custom_placeholder: 'örneğin openai/gpt-5.4',
@@ -13690,6 +13928,7 @@ const LOCALES = {
     model_scope_toast: 'Bir sonraki mesajınızdan itibaren bu görüşmeye uygulanır.',
     // commands.js
     cmd_clear: 'Konuşma mesajlarını temizle',
+    cmd_help: 'Show available slash commands',
     cmd_compress: 'Konuşma içeriğini manuel olarak sıkıştırın (kullanım: /compress [konuya odaklan])',
     ctx_compress_hint: 'Yer açmak için bağlamı sıkıştırın →',
     ctx_compress_action: '⚠ Şimdi serbest bağlama sıkıştırın',
@@ -13885,6 +14124,7 @@ const LOCALES = {
     file_open_failed: 'Dosya açılamadı',
     downloading: (name) => `${name} indiriliyor\u2026`,
     double_click_rename: 'Yeniden adlandırmak için çift tıklayın',
+    session_rename_failed_no_row: 'Could not start rename — row not found.',
     renamed_to: 'Yeniden adlandırıldı',
     rename_failed: 'Yeniden adlandırma başarısız oldu:',
     delete_title: 'Sil',
@@ -14289,6 +14529,9 @@ const LOCALES = {
     providers_oauth_config_yaml_hint: 'Belirteç config.yaml aracılığıyla yapılandırıldı. Güncellemek için config.yaml dosyanızdaki sağlayıcılar bölümünü düzenleyin veya hermes auth\'u çalıştırın.',
     providers_oauth_not_configured_hint: 'Kimliği doğrulanmadı. Bu sağlayıcıyı yapılandırmak için terminalde Hermes Auth komutunu çalıştırın.',
     providers_save: 'Kaydetmek',
+    providers_refresh_models: 'Refresh models',
+    providers_refreshing: 'Refreshing…',
+    providers_models_refreshed: 'Models refreshed',
     providers_remove: 'Kaldırmak',
     providers_saving: 'Kaydediliyor\u2026',
     providers_removing: 'Kaldırılıyor\u2026',
@@ -14452,6 +14695,8 @@ const LOCALES = {
 
     // panel/runtime i18n
     error_prefix: 'Hata:',
+    default: 'default',
+    search: 'Search',
     not_available: 'Yok',
     never: 'Asla',
     add: 'Eklemek',
@@ -14490,6 +14735,7 @@ const LOCALES = {
     cron_collapse_prompt: 'İstemi daralt',
     cron_expand_output: 'Çıktıyı genişlet',
     cron_collapse_output: 'Çıktıyı daralt',
+    cron_view_full_output: 'View full output',
     cron_all_runs: 'Tüm koşular',
     cron_hide_runs: 'Çalıştırmaları gizle',
     cron_no_runs_yet: '(henüz koşu yok)',
@@ -14638,6 +14884,7 @@ const LOCALES = {
     cron_prompt_label: 'Çabuk',
     cron_deliver_label: 'Çıktıyı şuraya ilet:',
     cron_deliver_local: 'Yerel (yalnızca çıktıyı kaydet)',
+    cron_deliver_custom: 'Ozel teslimat hedefi',
     cron_profile_label: 'Profil',
     cron_profile_server_default: 'sunucu varsayılanı',
     cron_profile_server_default_hint: 'Çalışma zamanında WebUI sunucusunun varsayılan profilini kullanır. Profili olmayan mevcut işler bu eski davranışı sürdürüyor.',
@@ -14754,6 +15001,18 @@ const LOCALES = {
     insights_model_share: 'Paylaşmak',
     insights_no_usage_data: 'Henüz kullanım verisi yok',
     insights_footer: 'Son {days} günün verileri gösteriliyor',
+    insights_skill_usage_title: 'Skill Usage',  // TODO: translate
+    insights_skill_usage_sub: 'Tool invocation frequency',  // TODO: translate
+    insights_skill_usage_total: 'Total invocations',  // TODO: translate
+    insights_skill_usage_skills_used: 'Skills used',  // TODO: translate
+    insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
+    insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
+    insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Giriş',
     insights_messages: 'Mesajlar',
     insights_models: 'Modeller',
@@ -14851,7 +15110,7 @@ function t(key, ...args) {
 function setLocale(lang) {
   const resolved = resolveLocale(lang) || 'en';
   _locale = LOCALES[resolved];
-  localStorage.setItem('hermes-lang', resolved);
+  try { localStorage.setItem('hermes-lang', resolved); } catch (_) {}
   document.documentElement.lang = _locale._speech || resolved;
 }
 
@@ -14860,7 +15119,9 @@ function setLocale(lang) {
  * Server-persisted preference is applied later in loadSettingsPanel().
  */
 function loadLocale() {
-  setLocale(resolvePreferredLocale(null, localStorage.getItem('hermes-lang')));
+  let stored = null;
+  try { stored = localStorage.getItem('hermes-lang'); } catch (_) {}
+  setLocale(resolvePreferredLocale(null, stored));
 }
 
 /**

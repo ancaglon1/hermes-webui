@@ -1,6 +1,6 @@
 (function(){
   // Clear stale stop-server flag on successful page load (server is reachable)
-  localStorage.removeItem('hermes-webui-server-stopped');
+  try{localStorage.removeItem('hermes-webui-server-stopped');}catch(_){}
   // Listen for shutdown broadcast from other tabs
   try {
     var _stopChan = new BroadcastChannel('hermes-webui-shutdown');
@@ -29,7 +29,8 @@ async function cancelSessionStream(session){
   if(!streamId||!sid) return;
   try{
     await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
-  }catch(e){/* cancel request failed - cleanup below still runs */}
+  }catch(e){/* close local stream; keep UI state honest below */}
+  if(typeof closeLiveStream==='function') closeLiveStream(sid, streamId);
   session.active_stream_id=null;
   delete INFLIGHT[sid];
   clearInflightState(sid);
@@ -1029,7 +1030,6 @@ function _applySessionContextMetadataUpdate(data){
 }
 
 $('modelSelect').onchange=async()=>{
-  if(!S.session)return;
   const selectedModel=$('modelSelect').value;
   const modelState=(typeof _modelStateForSelect==='function')
     ? _modelStateForSelect($('modelSelect'),selectedModel)
@@ -1037,10 +1037,16 @@ $('modelSelect').onchange=async()=>{
   if(typeof closeModelDropdown==='function') closeModelDropdown();
   if(typeof _writePersistedModelState==='function') _writePersistedModelState(modelState.model,modelState.model_provider);
   else try{localStorage.setItem('hermes-webui-model',modelState.model)}catch{}
+  if(!S.session){
+    if(typeof syncModelChip==='function') syncModelChip();
+    if(typeof syncReasoningChip==='function') syncReasoningChip();
+    return;
+  }
   if(typeof _rememberPendingSessionModel==='function') _rememberPendingSessionModel(S.session.session_id,modelState.model,modelState.model_provider);
   S.session.model=modelState.model;
   S.session.model_provider=modelState.model_provider||null;
   if(typeof syncModelChip==='function') syncModelChip();
+  if(typeof syncReasoningChip==='function') syncReasoningChip();
   syncTopbar();
   // Clarify scope: composer model changes are session-local, not the global default.
   if(typeof showToast==='function'){
