@@ -712,7 +712,9 @@ window._micPendingSend=window._micPendingSend||false;
 (function(){
   const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
   const hasSTT=!(!SpeechRecognition);
-  const hasTTS=!!('speechSynthesis' in window);
+  // TTS is always available — served by the Piper backend (/api/tts),
+  // the browser engine is used only as a fallback for voice-mode control.
+  const hasTTS=true;
 
   // Need both STT and TTS for turn-based voice mode
   if(!hasSTT||!hasTTS) return;
