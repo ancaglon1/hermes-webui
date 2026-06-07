@@ -9467,8 +9467,6 @@ def _normalize_tts_prosody(value, *, unit: str) -> str | None:
     return None
 
 
-<<<<<<< HEAD
-=======
 def _handle_tts(handler, parsed):
     """Generate TTS audio via Edge TTS. POST JSON body only.
 
@@ -9626,7 +9624,7 @@ def _handle_tts(handler, parsed):
         logger.exception("Edge TTS generation failed")
         from api.helpers import bad as _bad
         return _bad(handler, "TTS generation failed", 500)
->>>>>>> bc6949219da15ab4dce84d522f84e7e092f2cca5
+
 def _html_preview_with_blank_base(raw: bytes) -> bytes:
     base = '<base target="_blank">'
     text = raw.decode("utf-8", errors="replace")
