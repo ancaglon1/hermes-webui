@@ -2833,7 +2833,7 @@ def _message_counts_as_renderable_for_window(message) -> bool:
     return bool(role and role != "tool")
 
 
-def _message_window_for_display(messages, msg_limit=None, msg_before=None) -> tuple[list, int]:
+def _message_window_for_display(messages, msg_limit=None, msg_before=None, expand_renderable=False) -> tuple[list, int]:
     """Return a paginated message window plus its offset in ``messages``.
 
     The normal fast path is a raw tail window. If that window contains no
@@ -2863,6 +2863,33 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None) -> tu
                 start_idx = max(0, end_idx - limit)
                 window = source[start_idx:end_idx]
                 break
+    if limit > 1 and window and expand_renderable:
+        # ``msg_limit`` is a raw-message transport cap, but the WebUI renders a
+        # filtered transcript: role=tool rows, empty separator assistants, and
+        # compression markers can all disappear. A long tool-heavy tail can
+        # therefore produce a cold reload that visibly contains only one or two
+        # messages plus a huge "Load earlier" button. Expand the raw window
+        # backwards until it contains roughly ``limit`` renderable transcript
+        # rows, while keeping the raw offset cursor honest.
+        #
+        # Gated behind the explicit ``expand_renderable`` flag, which the
+        # frontend sends ONLY on the initial cold-load fetch. It must NOT apply
+        # to the "Load earlier" cumulative path (which re-requests with a larger
+        # msg_limit and no msg_before) nor the msg_before fallback page — those
+        # keep the raw transport cap so one scroll-up can't pull a whole
+        # tool-heavy transcript back in a single response. Cold loads are the
+        # only place the "1-2 visible messages" cliff happens.
+        renderable_count = sum(1 for msg in window if _message_counts_as_renderable_for_window(msg))
+        if renderable_count < limit:
+            target_renderable = min(
+                limit,
+                sum(1 for msg in source if _message_counts_as_renderable_for_window(msg)),
+            )
+            while start_idx > 0 and renderable_count < target_renderable:
+                start_idx -= 1
+                if _message_counts_as_renderable_for_window(source[start_idx]):
+                    renderable_count += 1
+            window = source[start_idx:end_idx]
     return window, start_idx
 
 
@@ -3348,7 +3375,13 @@ from api.workspace import (
     _is_remote_terminal_backend,
     _workspace_blocked_roots,
 )
-from api.upload import handle_upload, handle_upload_extract, handle_transcribe, handle_workspace_upload
+from api.upload import (
+    handle_upload,
+    handle_upload_extract,
+    handle_transcribe,
+    handle_transcribe_capability,
+    handle_workspace_upload,
+)
 from api.streaming import (
     _sse,
     _run_agent_streaming,
@@ -3560,6 +3593,15 @@ _LOGIN_LOCALE = {
         "btn": "Oturum a\u00e7",
         "invalid_pw": "Ge\u00e7ersiz \u015fifre",
         "conn_failed": "Ba\u011flant\u0131 ba\u015far\u0131s\u0131z",
+    },
+    "pl": {
+        "lang": "pl-PL",
+        "title": "Zaloguj si\u0119",
+        "subtitle": "Wpisz has\u0142o, aby kontynuowa\u0107",
+        "placeholder": "Has\u0142o",
+        "btn": "Zaloguj si\u0119",
+        "invalid_pw": "Nieprawid\u0142owe has\u0142o",
+        "conn_failed": "Po\u0142\u0105czenie nie powiod\u0142o si\u0119",
     },
 }
 
@@ -5271,6 +5313,9 @@ def handle_get(handler, parsed) -> bool:
             pass
         return j(handler, settings)
 
+    if parsed.path == "/api/transcribe/capability":
+        return handle_transcribe_capability(handler)
+
     if parsed.path == "/api/reasoning":
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
@@ -5356,6 +5401,14 @@ def handle_get(handler, parsed) -> bool:
             msg_before = int(_msg_before) if _msg_before else None
         except (ValueError, TypeError):
             msg_before = None
+        # ?expand_renderable=1 — sent ONLY by the initial cold-load fetch. When
+        # set, the tail window is expanded backward until it holds ~msg_limit
+        # *renderable* rows (tool/separator/compression rows are UI-filtered) so
+        # a tool-heavy session doesn't cold-load showing 1-2 visible messages.
+        # The "Load earlier" cumulative path and msg_before pages do NOT send it,
+        # keeping their raw transport cap (#3790).
+        _expand_renderable = query.get("expand_renderable", [None])[0]
+        expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
         try:
             _t1 = _time.monotonic()
             s = get_session(sid, metadata_only=(not load_messages))
@@ -5440,6 +5493,7 @@ def handle_get(handler, parsed) -> bool:
                     _all_msgs,
                     msg_limit=msg_limit,
                     msg_before=msg_before,
+                    expand_renderable=expand_renderable,
                 )
                 if msg_before is not None:
                     _before_idx = max(0, min(int(msg_before), len(_all_msgs)))
@@ -7211,6 +7265,23 @@ def handle_post(handler, parsed) -> bool:
             shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
         except Exception:
             logger.debug("Failed to clean attachment dir for deleted session %s", sid)
+        # Remove the turn-journal shards and the run-journal directory so a
+        # deleted conversation is not recoverable from disk. The session JSON +
+        # state.db rows are cleared above, but these journals retain the user's
+        # messages (turn journal) and the full request/response payloads (run
+        # journal) in plaintext. (#3802)
+        try:
+            from api.turn_journal import delete_turn_journal
+
+            delete_turn_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete turn journal for deleted session %s", sid)
+        try:
+            from api.run_journal import delete_run_journal
+
+            delete_run_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete run journal for deleted session %s", sid)
         # Prune the per-session agent lock so deleted sessions don't leak
         # Lock entries in SESSION_AGENT_LOCKS forever.
         with SESSION_AGENT_LOCKS_LOCK:
