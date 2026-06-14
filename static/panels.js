@@ -6801,6 +6801,22 @@ async function loadSettingsPanel(){
           if(v.value===current) opt.selected=true;
           ttsVoiceSel.appendChild(opt);
         });
+      } else if(engine==='piper'){
+        ttsVoiceSel.innerHTML='<option value="">Loading…</option>';
+        fetch(new URL('api/tts/voices', document.baseURI||location.href).href)
+          .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
+          .then(function(data){
+            ttsVoiceSel.innerHTML='<option value="">Default ('+esc(data.default||'en_GB-alba-medium')+')</option>';
+            (data.voices||[]).forEach(function(v){
+              var opt=document.createElement('option');
+              opt.value=v.id;opt.textContent=v.display_name||v.id;
+              if(v.id===current) opt.selected=true;
+              ttsVoiceSel.appendChild(opt);
+            });
+          })
+          .catch(function(){
+            ttsVoiceSel.innerHTML='<option value="">Piper voices unavailable</option>';
+          });
       } else {
         if(!('speechSynthesis' in window)){
           ttsVoiceSel.innerHTML='<option value="">Speech synthesis not available</option>';

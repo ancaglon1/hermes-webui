@@ -4935,6 +4935,8 @@ function _buildBrowserUtterance(text, btn){
 }
 
 function _playEdgeTtsChunked(text, btn){
+  _ttsSpeaking=true;_playingEdgeAudio=null;
+  if(btn) btn.dataset.speaking='1';
   const chunks=_splitForTTS(text);
   const _playOne=function(idx){
     if(idx>=chunks.length){
@@ -4943,7 +4945,8 @@ function _playEdgeTtsChunked(text, btn){
       return;
     }
     const chunk=chunks[idx];
-    const voice=localStorage.getItem('hermes-tts-voice')||'zh-CN-XiaoxiaoNeural';
+    const _eng=localStorage.getItem('hermes-tts-engine')||'browser';
+    const voice=localStorage.getItem('hermes-tts-voice')||(_eng==='piper'?'en_GB-alba-medium':'zh-CN-XiaoxiaoNeural');
     const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
     const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
     let rate='', pitch='';
@@ -5010,7 +5013,7 @@ function speakMessage(btn){
   if(!clean) return;
 
   const engine=localStorage.getItem('hermes-tts-engine')||'browser';
-  if(engine==='edge'){
+  if(engine==='edge'||engine==='piper'){
     _playEdgeTtsChunked(clean, btn);
     return;
   }
