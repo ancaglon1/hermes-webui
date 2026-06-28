@@ -338,12 +338,78 @@ def test_scene_renderer_coalesces_row_updates_and_renders_in_scene_order():
     render = _function_body(UI_JS, "_renderAnchorSceneRowsIntoWorklog")
     live = _function_body(UI_JS, "renderLiveAnchorActivityScene")
 
+    assert "const live=!settled" in rows
+    assert "const liveProseTextKeys=new Map()" in rows
+    assert "if(textKey&&liveProseTextKeys.has(textKey)) continue;" in rows
     assert "byKey.set(key,out.length)" in rows
     assert "out[index]=row.role==='tool'?_anchorSceneMergeToolRows(out[index],row):row" in rows
     assert "for(const row of rows)" in render
     assert "_anchorSceneNodeForRow(row,opts)" in render
     assert "blocks.querySelectorAll('[data-live-assistant=\"1\"]')" in live
     assert "assistant-segment-worklog-source" in live
+    assert "el.hidden=true" in live
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required for anchor row normalization tests")
+def test_live_anchor_scene_dedupes_exact_duplicate_process_prose_only_live():
+    script = f"""
+const fs = require('fs');
+const src = fs.readFileSync({json.dumps(str(ROOT / "static" / "ui.js"))}, 'utf8');
+function extractFunc(name){{
+  const start = src.indexOf('function ' + name);
+  if(start === -1) throw new Error(name + ' not found');
+  const params = src.indexOf('(', start);
+  let depth = 0, close = -1;
+  for(let i=params; i<src.length; i++){{
+    if(src[i] === '(') depth++;
+    else if(src[i] === ')'){{
+      depth--;
+      if(depth === 0){{ close = i; break; }}
+    }}
+  }}
+  const brace = src.indexOf('{{', close);
+  depth = 0;
+  for(let i=brace; i<src.length; i++){{
+    if(src[i] === '{{') depth++;
+    else if(src[i] === '}}'){{
+      depth--;
+      if(depth === 0) return src.slice(start, i + 1);
+    }}
+  }}
+  throw new Error(name + ' body did not close');
+}}
+function _anchorSceneToolRowLogicalKey(){{ return ''; }}
+function _anchorSceneMergeToolRows(a,b){{ return b; }}
+function _anchorSceneIsSettledSuccessfulCompression(){{ return false; }}
+eval(extractFunc('_anchorSceneRowsForRendering'));
+const scene = {{
+  activity_rows: [
+    {{role:'prose', local_id:'reasoning:291', text:'same process prose'}},
+    {{role:'prose', local_id:'interim:293', text:' same\\nprocess prose '}},
+    {{role:'thinking', local_id:'thinking:1', text:'same process prose'}},
+    {{role:'prose', local_id:'process:294', text:'new process prose'}}
+  ]
+}};
+const liveRows = _anchorSceneRowsForRendering(scene, {{settled:false}});
+const settledRows = _anchorSceneRowsForRendering(scene, {{settled:true}});
+console.log(JSON.stringify({{
+  live: liveRows.map(row => row.role + ':' + row.text.replace(/\\s+/g, ' ').trim()),
+  settled: settledRows.map(row => row.role + ':' + row.text.replace(/\\s+/g, ' ').trim())
+}}));
+"""
+    result = _run_node_script(script)
+
+    assert result["live"] == [
+        "prose:same process prose",
+        "thinking:same process prose",
+        "prose:new process prose",
+    ]
+    assert result["settled"] == [
+        "prose:same process prose",
+        "prose:same process prose",
+        "thinking:same process prose",
+        "prose:new process prose",
+    ]
 
 
 def test_live_anchor_scene_removes_legacy_interim_collapse_toggle():
@@ -359,6 +425,20 @@ def test_live_anchor_scene_removes_legacy_interim_collapse_toggle():
     remove_idx = interim.index("blocks.querySelectorAll('.interim-collapse-toggle').forEach(el=>el.remove())")
     legacy_create_idx = interim.index("let toggle=blocks.querySelector('.interim-collapse-toggle')")
     assert guard_idx < remove_idx < legacy_create_idx
+
+
+def test_recycled_assistant_turn_clears_live_anchor_attrs_before_role_refresh():
+    reset_attrs = UI_JS[UI_JS.index("const _recycleResetAttrs="):UI_JS.index("let _scrollbarDragActive=false;")]
+    assert "data-anchor-scene-live-owner" in reset_attrs
+    assert "data-anchor-stream-id" in reset_attrs
+    assert "data-live-assistant-turn" in reset_attrs
+
+    recycle = _function_body(UI_JS, "renderMessages")
+    recycle = recycle[recycle.index("if(!currentAssistantTurn){"):]
+
+    loop_idx = recycle.index("for(const attr of _recycleResetAttrs) recycled.removeAttribute(attr);")
+    refresh_idx = recycle.index("if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');")
+    assert loop_idx < refresh_idx
 
 
 def test_tool_scene_rows_coalesce_by_logical_tool_call_identity():
@@ -540,11 +620,16 @@ def test_stream_end_restore_attaches_projected_anchor_scene_before_render():
 def test_cancel_settlement_attaches_projected_anchor_scene_before_render():
     cancel = _event_listener_body(MESSAGES_JS, "cancel")
 
-    fetch_idx = cancel.index("const _nextMsgs3018=(data.session.messages||[]).filter(m=>m&&m.role);")
+    fetch_idx = cancel.index("const _nextMsgs3018=(sessionPayload.messages||[]).filter(m=>m&&m.role);")
     attach_idx = cancel.index("_attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);")
     carry_idx = cancel.index("S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);")
     render_idx = cancel.index("renderMessages({preserveScroll:true});")
     assert fetch_idx < attach_idx < carry_idx < render_idx
+
+    embedded_idx = cancel.index("if(_applyCancelSessionPayload(_cancelSessionPayload)) return;")
+    fallback_get_idx = cancel.index("const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);")
+    fallback_apply_idx = cancel.index("if(data&&data.session) _applyCancelSessionPayload(data.session);")
+    assert embedded_idx < fallback_get_idx < fallback_apply_idx
 
     fallback_push_idx = cancel.index("S.messages.push({role:'assistant',content:`**Task cancelled:**")
     fallback_attach_idx = cancel.index("_attachProjectedAnchorSceneToLastAssistant(S.messages);", fallback_push_idx)
@@ -629,9 +714,10 @@ def test_settled_anchor_scene_persists_the_full_assistant_turn_not_only_tail():
     assert "messages.slice(turnStart+1,lastAsstIndex+1)" in complete
     assert "message.reasoning||message._reasoning||message.reasoning_content||message.thinking" in reasoning_text
     assert "const reasoning=_anchorSceneMessageReasoningText(message);" in rows_by_message
-    assert "const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[]" in rows_by_message
-    assert "idx<=turnStart||idx>=lastAsstIndex" in rows_by_message
-    assert "add(idx,_anchorSceneToolRowFromCall(tool,order++,idx));" in rows_by_message
+    assert "const toolsByIdx=new Map();" in rows_by_message
+    assert "if(S.toolCalls) for(const tc of S.toolCalls){" in rows_by_message
+    assert "for(const tool of (toolsByIdx.get(idx)||[]))" in rows_by_message
+    assert "_anchorSceneToolRowFromCall(tool,0,idx)" in rows_by_message
 
 
 def test_settled_anchor_scene_preserves_live_projected_order_before_backfill():
@@ -640,7 +726,7 @@ def test_settled_anchor_scene_preserves_live_projected_order_before_backfill():
 
     projected_idx = complete.index("const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];")
     projected_push_idx = complete.index("for(const row of projectedRows){")
-    backfill_idx = complete.index("for(let idx=turnStart+1;idx<lastAsstIndex;idx+=1)")
+    backfill_idx = complete.index("for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1)")
     terminal_idx = complete.index("if(row&&row.role==='terminal') pushRow(row);", backfill_idx)
     assert projected_idx < projected_push_idx < backfill_idx < terminal_idx
 
@@ -752,7 +838,47 @@ def test_settled_anchor_scene_final_answer_does_not_fold_into_worklog_source():
         "if(m._activityBurstId!==undefined||m._liveSegmentSeq!==undefined) return true;"
     )
     assert "seg.classList.add('assistant-segment-worklog-source')" in render
+    assert "seg.hidden=true" in render
     assert "_renderSettledAnchorSceneForMessage(msg, seg, rawIdx)" in render
+
+
+def test_settled_anchor_scene_promotes_final_content_array_to_ordered_activity_rows():
+    complete = _function_body(MESSAGES_JS, "_completeSettledAnchorSceneForTurn")
+    rows_by_message = _function_body(MESSAGES_JS, "_anchorSceneRowsByMessageIndex")
+    content_rows = _function_body(MESSAGES_JS, "_anchorSceneRowsFromContentParts")
+    final_answer = _function_body(MESSAGES_JS, "_anchorSceneFinalAnswerText")
+    content_text = _function_body(MESSAGES_JS, "_anchorSceneContentText")
+    visible_text = _function_body(MESSAGES_JS, "_anchorSceneContentVisibleText")
+
+    assert "const messageFinalAnswer=_anchorSceneFinalAnswerText(lastAsst);" in complete
+    assert "const finalAnswer=_anchorSceneCleanText(messageFinalAnswer)" in complete
+    assert "_anchorSceneRowsByMessageIndex(messages,turnStart,lastAsstIndex,{includeFinal:true})" in complete
+    assert "for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1)" in complete
+    assert "options=(options&&typeof options==='object')?options:{};" in rows_by_message
+    assert "const endIndex=options&&options.includeFinal?lastAsstIndex+1:lastAsstIndex;" in rows_by_message
+    assert "const contentRows=_anchorSceneRowsFromContentParts(message,idx,{isFinalMessage:idx===lastAsstIndex});" in rows_by_message
+    assert "part.type==='tool_use'" in content_rows
+    assert "const isFinalMessage=!!options.isFinalMessage;" in content_rows
+    assert "if(!part||typeof part!=='object'){" in content_rows
+    assert "if(isFinalMessage&&i>lastToolIndex) continue;" in content_rows
+    assert "if(isFinalMessage&&i>lastToolIndex&&_anchorSceneContentVisibleText(part)) continue;" in content_rows
+    assert "_anchorSceneProseRow(text,rows.length,messageIndex)" in content_rows
+    assert "_anchorSceneToolRowFromCall(_anchorSceneContentTool(part),rows.length,messageIndex)" in content_rows
+    assert "lastToolIndex+1" in final_answer
+    assert "_anchorSceneContentVisibleText(part)" in final_answer
+    assert "if(typeof part==='string') return part;" in content_text
+    assert "part.thinking||part.reasoning||part.summary" in content_text
+    assert "partType==='thinking'||partType==='reasoning'" in visible_text
+    assert "part.text||part.input_text||part.output_text" in visible_text
+    assert "_fromContent:true" in rows_by_message
+    assert "const useStartedAt=!hasOrderedContentRows;" in rows_by_message
+    assert "if(useStartedAt){" in rows_by_message
+    assert "const {_phase,_encounter,_fromContent,...clean}=row;" in rows_by_message
+    content_tool = _function_body(MESSAGES_JS, "_anchorSceneContentTool")
+    assert "part.id||part.tid||part.tool_call_id||part.tool_use_id||part.call_id" in content_tool
+    assert "part.name||part.tool_name||fn.name||'tool'" in content_tool
+    assert "args:part.args" in content_tool
+    assert "input:part.input" in content_tool
 
 
 def test_settled_anchor_scene_hides_prior_process_segments_not_final_answer():
@@ -763,6 +889,7 @@ def test_settled_anchor_scene_hides_prior_process_segments_not_final_answer():
     assert "idx<rawIdx" in settled
     assert "node.classList.add('assistant-segment-worklog-source')" in settled
     assert "node.setAttribute('aria-hidden','true')" in settled
+    assert "node.hidden=true" in settled
     assert "turnDuration:message._turnDuration!==undefined&&message._turnDuration!==null?message._turnDuration:scene.turn_duration" in settled
     assert "turnDuration:opts&&opts.turnDuration" in group
     assert "data-turn-duration" in group
@@ -807,17 +934,20 @@ def test_legacy_settled_worklog_summary_uses_processed_anchor_too():
     assert ".tool-worklog-group[data-tool-worklog-group=\"1\"]:not([data-run-activity-group=\"1\"]) .tool-worklog-summary" in STYLE_CSS
 
 
-def test_live_processed_anchor_is_not_clickable_until_settled():
+def test_live_processed_anchor_is_clickable_while_streaming():
     toggle = _function_body(UI_JS, "_toggleActivityGroup")
     ensure = _function_body(UI_JS, "ensureActivityGroup")
     finalize = _function_body(UI_JS, "_finalizeLiveActivityDisclosureGroup")
     close = _function_body(UI_JS, "closeCurrentLiveActivityGroup")
 
-    assert "group.getAttribute('data-live-tool-call-group')==='1'&&group.getAttribute('data-live-activity-current')==='1'" in toggle
-    assert "return;" in toggle
-    assert "summary.setAttribute('data-live-summary-static','1')" in ensure
-    assert "summary.setAttribute('aria-disabled','true')" in ensure
-    assert "summary.disabled=true" in ensure
+    assert "data-live-activity-current')==='1'" not in toggle
+    assert "_writeActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'), !collapsed);" in toggle
+    assert "_onLiveActivityToggle(group)" in toggle
+    assert "summary.setAttribute('data-live-summary-static','1')" not in ensure
+    assert "summary.setAttribute('aria-disabled','true')" not in ensure
+    assert "summary.disabled=true" not in ensure
+    assert "summary.removeAttribute('data-live-summary-static')" in ensure
+    assert "summary.removeAttribute('aria-disabled')" in ensure
     assert "summary.disabled=false" in ensure
     assert "group.removeAttribute('data-live-tool-call-group')" in finalize
     assert "group.removeAttribute('data-live-tool-worklog-group')" in finalize
@@ -828,8 +958,63 @@ def test_live_processed_anchor_is_not_clickable_until_settled():
     assert "summary.disabled=false" in finalize
     assert "summary.setAttribute('aria-expanded',keepOpen?'true':'false')" in finalize
     assert "_finalizeLiveActivityDisclosureGroup(group)" in close
-    assert ".tool-worklog-summary[data-live-summary-static=\"1\"]" in STYLE_CSS
-    assert ".tool-worklog-group[data-live-tool-call-group=\"1\"][data-live-activity-current=\"1\"] .tool-call-group-chevron" in STYLE_CSS
+    assert ".tool-worklog-summary[data-live-summary-static=\"1\"]" not in STYLE_CSS
+    assert ".tool-worklog-group[data-live-tool-call-group=\"1\"][data-live-activity-current=\"1\"] .tool-call-group-chevron" not in STYLE_CSS
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required for live disclosure behavior tests")
+def test_live_processed_anchor_toggle_collapses_current_worklog_group():
+    script = f"""
+const assert = require('assert');
+let collapsed = false;
+let open = true;
+let wrote = null;
+let liveExpanded = null;
+function _writeActivityDisclosureState(key, value) {{ wrote = [key, value]; }}
+function _onLiveActivityToggle(group) {{ liveExpanded = !group.classList.contains('tool-call-group-collapsed'); }}
+const group = {{
+  attrs: {{
+    'data-live-tool-call-group': '1',
+    'data-live-activity-current': '1',
+    'data-activity-disclosure-key': 'live:stream-1'
+  }},
+  getAttribute(name) {{ return this.attrs[name] || ''; }},
+  classList: {{
+    toggle(name, force) {{
+      if (name === 'tool-call-group-collapsed') {{
+        collapsed = force === undefined ? !collapsed : !!force;
+        return collapsed;
+      }}
+      if (name === 'open') {{
+        open = force === undefined ? !open : !!force;
+        return open;
+      }}
+      throw new Error('unexpected class ' + name);
+    }},
+    contains(name) {{
+      if (name === 'tool-call-group-collapsed') return collapsed;
+      if (name === 'open') return open;
+      return false;
+    }}
+  }}
+}};
+const summary = {{
+  attrs: {{}},
+  closest(selector) {{ return group; }},
+  setAttribute(name, value) {{ this.attrs[name] = String(value); }}
+}};
+function _toggleActivityGroup(summary) {{
+{_function_body(UI_JS, "_toggleActivityGroup")}
+}}
+_toggleActivityGroup(summary);
+assert.strictEqual(collapsed, true);
+assert.strictEqual(open, false);
+assert.deepStrictEqual(wrote, ['live:stream-1', false]);
+assert.strictEqual(liveExpanded, false);
+assert.strictEqual(summary.attrs['aria-expanded'], 'false');
+    console.log(JSON.stringify({{ok:true}}));
+"""
+    _run_node_script(script)
 
 
 def test_pre_start_worklog_shell_shows_thinking_placeholder_immediately():
