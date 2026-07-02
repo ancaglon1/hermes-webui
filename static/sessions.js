@@ -12,6 +12,7 @@ const ICONS={
   edit:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/><path d="M10 4l2 2"/></svg>',
   spark:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8l1.1 3.1 3.1 1.1-3.1 1.1L8 10.2 6.9 7.1 3.8 6l3.1-1.1z"/><path d="M12.5 9.5l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5 1.5-.5z"/></svg>',
   link:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3a3 3 0 0 1 0-4.2l1.7-1.7a3 3 0 0 1 4.2 4.2l-1 1"/><path d="M9.3 6.7a3 3 0 0 1 0 4.2l-1.7 1.7a3 3 0 0 1-4.2-4.2l1-1"/></svg>',
+  download:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10.5v2.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-2.5"/><polyline points="4.5 7 8 10.5 11.5 7"/><line x1="8" y1="10.5" x2="8" y2="2"/></svg>',
 };
 
 // Tracks which session_id is currently being loaded. Used to discard stale
@@ -32,6 +33,7 @@ let _pendingCarryForwardSnapshot = null;
 let _draftSaveTimer = null;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
+const _composerDraftKnownPayloadSessions = new Set();
 
 function _profileMatchesActiveProfile(profile, activeProfile){
   const eventName = (typeof profile === 'string' && profile.trim()) ? profile.trim() : 'default';
@@ -98,21 +100,64 @@ async function _restoreRememberedNewChatDraftSession() {
 function _saveComposerDraft(sid, text, files) {
   if (!sid) return;
   clearTimeout(_draftSaveTimer);
+  const normalizedText = String(text || '');
+  const normalizedFiles = Array.isArray(files) ? files.filter(Boolean) : [];
+  if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
+    _composerDraftKnownPayloadSessions.add(sid);
+  }
   _draftSaveTimer = setTimeout(() => {
     api('/api/session/draft', {
       method: 'POST',
-      body: JSON.stringify({ session_id: sid, text: text || '', files: files || [] }),
+      body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles }),
+    }).then(() => {
+      _rememberComposerDraftPayloadState(sid, normalizedText, normalizedFiles);
     }).catch(() => {});
   }, _DRAFT_SAVE_DELAY_MS);
 }
 
+function _composerDraftHasPayload(text, files) {
+  return !!(String(text || '') || (Array.isArray(files) && files.filter(Boolean).length));
+}
+
+function _sessionComposerDraftHasPayload(session) {
+  const draft = session && session.composer_draft;
+  return !!(draft && _composerDraftHasPayload(draft.text, draft.files));
+}
+
+function _rememberComposerDraftPayloadState(sid, text, files) {
+  if (!sid) return;
+  const normalizedText = String(text || '');
+  const normalizedFiles = Array.isArray(files) ? files.filter(Boolean) : [];
+  if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
+    _composerDraftKnownPayloadSessions.add(sid);
+  } else {
+    _composerDraftKnownPayloadSessions.delete(sid);
+  }
+  if (S.session && S.session.session_id === sid) {
+    S.session.composer_draft = { text: normalizedText, files: normalizedFiles };
+  }
+}
+
 // Immediate save used before session switches.
 function _saveComposerDraftNow(sid, text, files) {
-  if (!sid) return;
+  if (!sid) return Promise.resolve();
   clearTimeout(_draftSaveTimer);
+  const normalizedText = String(text || '');
+  const normalizedFiles = Array.isArray(files) ? files.filter(Boolean) : [];
+  // Most chat switches leave an empty composer. Avoid putting the switch path
+  // behind a network POST unless there is new local draft content or an existing
+  // server draft that must be cleared.
+  if (!_composerDraftHasPayload(normalizedText, normalizedFiles)
+      && S.session && S.session.session_id === sid
+      && !_sessionComposerDraftHasPayload(S.session)
+      && !_composerDraftKnownPayloadSessions.has(sid)) {
+    return Promise.resolve();
+  }
   return api('/api/session/draft', {
     method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: text || '', files: files || [] }),
+    body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles }),
+  }).then(() => {
+    _rememberComposerDraftPayloadState(sid, normalizedText, normalizedFiles);
   }).catch(() => {});
 }
 
@@ -161,9 +206,11 @@ function _clearComposerDraft(sid) {
   if (!sid) return;
   clearTimeout(_draftSaveTimer);
   _clearRememberedNewChatDraftSession(sid);
-  api('/api/session/draft', {
+  return api('/api/session/draft', {
     method: 'POST',
     body: JSON.stringify({ session_id: sid, text: '' }),
+  }).then(() => {
+    _rememberComposerDraftPayloadState(sid, '', []);
   }).catch(() => {});
 }
 
@@ -201,6 +248,43 @@ const SESSION_LONG_PRESS_DELAY_MS = 400;
 const SESSION_ARCHIVE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_DELETE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_SWIPE_CANCEL_RATIO = 0.75;
+
+function _manualTitleAuxConfigFromPayload(auxData){
+  if(!auxData||typeof auxData!=='object'||Array.isArray(auxData)) return null;
+  if(auxData.title_generation&&typeof auxData.title_generation==='object') return auxData;
+  const tasks=Array.isArray(auxData.tasks)?auxData.tasks:null;
+  if(!tasks) return null;
+  const taskMap={};
+  for(const task of tasks){
+    if(task&&typeof task==='object'&&typeof task.task==='string'&&task.task){
+      taskMap[task.task]=task;
+    }
+  }
+  if(!Object.keys(taskMap).length) return null;
+  return taskMap;
+}
+
+async function _loadManualTitleAuxConfig(){
+  try{
+    const auxData=await api('/api/model/auxiliary',{retries:0,timeoutToast:false});
+    return _manualTitleAuxConfigFromPayload(auxData);
+  }catch(_){
+    return null;
+  }
+}
+
+async function _manualTitleRegenerateTimeoutMs(){
+  let cfg=null;
+  try{
+    const auxConfig=await _loadManualTitleAuxConfig();
+    cfg=auxConfig&&auxConfig.title_generation;
+  }catch(_){
+    return null;
+  }
+  const timeoutSeconds=Number(cfg&&cfg.timeout);
+  if(!Number.isFinite(timeoutSeconds)||timeoutSeconds<=0) return null;
+  return Math.max(30000,Math.round((timeoutSeconds+5)*1000));
+}
 
 function _formatSessionModelWithGateway(s){
   if(!s||!s.model)return'';
@@ -888,7 +972,11 @@ async function newSession(flash, options={}){
     };
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
     if(options&&options.worktree) reqBody.worktree=true;
-    if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
+    if(Object.prototype.hasOwnProperty.call(options,'project_id')){
+      reqBody.project_id=options.project_id;
+    } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
+      reqBody.project_id=_activeProject;
+    }
     // Forward a pre-session toolset override only from the empty composer (#4490).
     if(!S.session && Array.isArray(S._pendingSessionToolsets)) reqBody.enabled_toolsets=S._pendingSessionToolsets;
     const modelSelForNew=$('modelSelect');
@@ -1021,11 +1109,17 @@ async function newSession(flash, options={}){
     }
     updateQueueBadge(S.session.session_id);
     syncTopbar();renderMessages();
-    const dirLoad=loadDir('.');
-    // loadDir('.') is fire-and-forget while the workspace panel is closed:
-    // waiting would block new-chat/profile-switch flow for users who never open
-    // the file tree. When visible, wait so the file list lands with the session.
-    if(options&&options.awaitWorkspaceLoad) await dirLoad;
+    // Keep new-chat first paint instant. The workspace tree / git badge can
+    // refresh right after paint unless this caller explicitly needs it loaded
+    // before continuing (profile/default-workspace binding path).
+    if(options&&options.awaitWorkspaceLoad){
+      await loadDir('.');
+    }else if(typeof _deferWorkspaceRefreshForSession==='function'){
+      _deferWorkspaceRefreshForSession(S.session.session_id);
+    }else{
+      const _dirP=loadDir('.');
+      if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
+    }
     // don't call renderSessionList here - callers do it when needed
   })();
   try{
@@ -1151,6 +1245,7 @@ async function loadSession(sid){
       snapshotLiveTurnHtmlForSession(currentSid);
     }
   }
+  const _keepStaleUntilLoaded = !!opts.keepStaleUntilLoaded && sameSessionForceReload;
   if (currentSid !== sid || forceReload) {
     // #3306: When force-reloading the currently-active session (e.g. external
     // poll triggering a refresh), snapshot the existing messages BEFORE we
@@ -1169,10 +1264,27 @@ async function loadSession(sid){
     // instead of collapsing a long session back to the default tail window.
     if (sameSessionForceReload) _captureSameSessionForceReloadHint(sid);
     else _clearSameSessionForceReloadHint();
-    S.messages = [];
-    S.toolCalls = [];
-    _messagesTruncated = false;
-    _oldestIdx = 0;
+    // #5177: keep-stale-until-loaded path — defer the destructive
+    // S.messages/toolCalls clear so the user does NOT see a transcript-wide
+    // blank gap during the metadata + messages round-trip. Only the
+    // visibility / focus recovery callers in refreshActiveSessionIfExternallyUpdated
+    // request this. The new transcript will be SWAPPED into S.messages by the
+    // forced _ensureMessagesLoaded(...{force:true}) call below, producing a
+    // single render frame with old DOM directly replaced by new DOM rather
+    // than the old → empty → new sequence the default branch produces.
+    //
+    // The session-switch branch (currentSid !== sid) MUST continue to clear
+    // synchronously — leaving a prior session's transcript on screen during a
+    // navigation is the original bug this clear was written for. We gate
+    // strictly on sameSessionForceReload (computed above as part of
+    // _keepStaleUntilLoaded) so cross-session switches keep their existing
+    // behaviour.
+    if (!_keepStaleUntilLoaded) {
+      S.messages = [];
+      S.toolCalls = [];
+      _messagesTruncated = false;
+      _oldestIdx = 0;
+    }
     // Close live SSE streams from the session we're leaving. The error
     // handler checks _isSessionActivelyViewed() and won't auto-reconnect
     // for a backgrounded session, preventing leaked connections that would
@@ -1308,14 +1420,15 @@ async function loadSession(sid){
   S._pendingSessionToolsets=null;
   if(typeof populateModelDropdown==='function'){
     const modelRefreshSid=sid;
+    const isActiveModelRefreshSession=()=>!!(S.session&&S.session.session_id===modelRefreshSid);
     if(!S._bootReady&&typeof window!=='undefined'&&typeof window._startBootModelDropdown==='function'){
       Promise.resolve().then(()=>{
-        if(_loadingSessionId!==modelRefreshSid) return;
+        if(!isActiveModelRefreshSession()) return undefined;
         return window._startBootModelDropdown();
       }).catch(()=>{});
     }else{
-      const modelRefreshPromise=Promise.resolve().then(()=>{
-        if(_loadingSessionId!==modelRefreshSid) return;
+      const modelRefreshPromise=_deferSessionSideEffect(modelRefreshSid,()=>{
+        if(!isActiveModelRefreshSession()) return undefined;
         return populateModelDropdown({freshness:'session_visit'});
       }).catch(()=>{});
       if(typeof window!=='undefined') window._modelDropdownReady=modelRefreshPromise;
@@ -1347,7 +1460,10 @@ async function loadSession(sid){
   _setActiveSessionUrl(S.session.session_id);
   if(typeof startSessionStream==='function') startSessionStream(S.session.session_id);
 
-  const activeStreamId=S.session.active_stream_id||null;
+  // `let` (not const): re-read below, after the awaited _ensureMessagesLoaded,
+  // so a server_turn_started that attaches a live stream MID-RELOAD is honored
+  // by the attach/idle decision instead of being clobbered by the stale snapshot.
+  let activeStreamId=S.session.active_stream_id||null;
   // If the server says the session is idle, reset browser-side streaming flags
   // NOW — before the async _ensureMessagesLoaded gap below. Without this,
   // S.busy can remain true from a still-running stream in the PREVIOUS session
@@ -1436,7 +1552,7 @@ async function loadSession(sid){
     // this session's INFLIGHT snapshot, not leave prior-session rows in place.
     if(typeof clearLiveToolCards==='function') clearLiveToolCards();
     try {
-      await _ensureMessagesLoaded(sid);
+      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded});
     } catch(e) {
       S.messages=inflightMessages;
     }
@@ -1521,7 +1637,7 @@ async function loadSession(sid){
       const liveTurn=document.getElementById('liveAssistantTurn');
       if(!liveTurn||!liveTurn.querySelector('.tool-call-group[data-tool-worklog-group="1"]')) ensureLiveWorklogShell();
     }
-    loadDir('.');
+    _deferWorkspaceRefreshForSession(sid);
     setBusy(true);setComposerStatus('');
     startApprovalPolling(sid);
     if(typeof startClarifyPolling==='function') startClarifyPolling(sid);
@@ -1529,8 +1645,12 @@ async function loadSession(sid){
   }else{
     // Phase 2b: Idle session — load full messages lazily for rendering.
     // _ensureMessagesLoaded is idempotent; it skips if S.messages already populated.
+    // #5177: when the caller asked us to keep stale messages until the new ones
+    // arrive (visibility/focus recovery), force the fetch so the
+    // "messages already populated" early-return inside _ensureMessagesLoaded
+    // does NOT skip the swap to the new transcript.
     try {
-      await _ensureMessagesLoaded(sid);
+      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded});
     } catch (e) {
       // Network errors, server failures, or SSE drops (Chrome error codes 4/5)
       // can cause _ensureMessagesLoaded to throw. Without a try/catch here the
@@ -1579,6 +1699,18 @@ async function loadSession(sid){
     // Attach pending user message if one is queued.
     _mergePendingSessionMessage(S.session,S.messages);
 
+    // Self-heal-vs-live-render race guard (maintainer/Codex-reproduced; verified
+    // in an isolated instance). `activeStreamId` was snapshotted BEFORE the
+    // awaited _ensureMessagesLoaded above. During a force reload (the
+    // `session-updated` self-heal or any keepStaleUntilLoaded recovery), a
+    // server-initiated turn can fire `server_turn_started` mid-await and set
+    // S.activeStreamId for THIS sid. Without re-reading, the idle branch below
+    // would clear S.activeStreamId/S.busy off the stale (null) snapshot and
+    // silently kill the live turn's render. Fold a concurrently-attached
+    // same-session stream into activeStreamId so the existing attach branch
+    // (and all its `attachLiveStream(sid, activeStreamId, ...)` calls) keeps it.
+    activeStreamId = activeStreamId || ((S.activeStreamId && S.session && S.session.session_id===sid) ? S.activeStreamId : null);
+
     if(activeStreamId){
       S.busy=true;
       S.activeStreamId=activeStreamId;
@@ -1600,7 +1732,7 @@ async function loadSession(sid){
         if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
         else appendThinking();
       }
-      loadDir('.');
+      _deferWorkspaceRefreshForSession(sid);
       updateQueueBadge(sid);
       startApprovalPolling(sid);
       if(typeof startClarifyPolling==='function') startClarifyPolling(sid);
@@ -1614,11 +1746,10 @@ async function loadSession(sid){
       updateQueueBadge(sid);
       syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
       if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
-      const _dirP=loadDir('.');
-      // Workspace refresh is guarded by session id inside loadDir(); do not
-      // block session-load completion, draft restore, or model resolution on
-      // file-tree IO for users focused on the chat.
-      if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
+      // Workspace refresh is guarded by session id inside loadDir(); keep it
+      // after the transcript's first paint so chat switching is not competing
+      // with file-tree / git badge IO.
+      _deferWorkspaceRefreshForSession(sid);
     }
   }
 
@@ -1767,12 +1898,30 @@ function _sessionListExcludeHiddenEnabled() {
   return _activeProject===null || _activeProject===NO_PROJECT_FILTER;
 }
 
+function _sessionArchivePagingFilterActive() {
+  let searchActive=false;
+  try{
+    const searchEl=typeof $==='function' ? $('sessionSearch') : null;
+    searchActive=Boolean(searchEl&&String(searchEl.value||'').trim());
+  }catch(_e){ searchActive=false; }
+  return Boolean(searchActive||_activeProject);
+}
+
 function _sessionListQueryString() {
   const qs = new URLSearchParams();
   qs.set('sidebar_source', _requestedSessionSidebarSource());
   if(_sessionListExcludeHiddenEnabled()) qs.set('exclude_hidden','1');
   if(_showAllProfiles) qs.set('all_profiles','1');
-  if(_showArchived) qs.set('include_archived','1');
+  if(_showArchived){
+    qs.set('include_archived','1');
+    if(!_sessionArchivePagingFilterActive()){
+      const archiveLimit=Math.min(
+        SESSION_ARCHIVED_MAX_LOADED_LIMIT,
+        Math.max(SESSION_ARCHIVED_PAGE_SIZE, Number(_archivedRowsLoadedLimit)||SESSION_ARCHIVED_PAGE_SIZE)
+      );
+      qs.set('archived_limit', String(archiveLimit));
+    }
+  }
   return `?${qs.toString()}`;
 }
 
@@ -2116,9 +2265,45 @@ async function _generateHandoffSummary(sid, rounds) {
   // retry.
 }
 
+function _afterSessionFirstPaint(fn, delayMs=0){
+  return new Promise((resolve)=>{
+    const invoke=()=>{
+      try{ resolve(typeof fn==='function' ? fn() : undefined); }
+      catch(_){ resolve(undefined); }
+    };
+    const run=()=>{
+      if(typeof requestIdleCallback==='function'){
+        requestIdleCallback(invoke,{timeout:1500});
+      }else{
+        setTimeout(invoke, delayMs);
+      }
+    };
+    if(typeof requestAnimationFrame==='function'){
+      requestAnimationFrame(()=>requestAnimationFrame(run));
+    }else{
+      setTimeout(run, delayMs);
+    }
+  });
+}
+
+function _deferSessionSideEffect(sid, fn, delayMs=0){
+  if(!sid||typeof fn!=='function') return Promise.resolve();
+  return _afterSessionFirstPaint(()=>{
+    if(!S.session||S.session.session_id!==sid) return undefined;
+    return fn();
+  },delayMs);
+}
+
+function _deferWorkspaceRefreshForSession(sid, opts={}){
+  _deferSessionSideEffect(sid,()=>{
+    const load=loadDir('.', opts);
+    if(load&&typeof load.catch==='function') load.catch(()=>{});
+  },150);
+}
+
 function _resolveSessionModelForDisplaySoon(sid){
   if(!sid) return;
-  setTimeout(async()=>{
+  _deferSessionSideEffect(sid,async()=>{
     try{
       const data=await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=1`);
       const model=data&&data.session&&data.session.model;
@@ -2248,9 +2433,21 @@ function _syncToolCallsForLoadedMessages(messages, sessionToolCalls){
   }
 }
 
-async function _ensureMessagesLoaded(sid) {
+async function _ensureMessagesLoaded(sid, opts) {
+  // `opts` is an explicit named parameter (vs loadSession's arguments[1]
+  // pattern) because _ensureMessagesLoaded is a module-private helper: it is
+  // only called from inside loadSession, so the public signature does not need
+  // to be preserved. Strict-mode engines optimize named params more reliably
+  // than arguments-indexing, and a named opts is self-documenting for static
+  // analysis. Callers pass {force:true} when they need to BYPASS the
+  // "messages already populated" early-return — currently only the #5177
+  // keep-stale-until-loaded path, which intentionally leaves the old messages
+  // in place (to avoid a visible disappear/reappear gap) and relies on
+  // _ensureMessagesLoaded to fetch and SWAP the new transcript into
+  // S.messages in a single frame.
+  opts = opts || {};
   // Already have messages? (e.g. from INFLIGHT restore path, already set)
-  if (S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role) {
+  if (!opts.force && S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role) {
     _clearSameSessionForceReloadHint(sid);
     return;
   }
@@ -2263,7 +2460,10 @@ async function _ensureMessagesLoaded(sid) {
   const expandParam = reloadLimit ? '&expand_renderable=1' : '';
   let data;
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`);
+    data = await api(
+      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
+      {timeoutMs:120000}
+    );
   } finally {
     _clearSameSessionForceReloadHint(sid);
   }
@@ -2747,7 +2947,10 @@ async function _loadOlderMessages() {
     // Cumulative growth: each "load more" asks for currentLoaded + 30, and the
     // newly exposed head is what we expose to the user.
     const requestedLimit = Math.max(_INITIAL_MSG_LIMIT, (S.messages || []).length + _INITIAL_MSG_LIMIT);
-    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${requestedLimit}`);
+    const data = await api(
+      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${requestedLimit}`,
+      {timeoutMs:120000}
+    );
     // Guard: api() may have redirected (401) and returned undefined.
     if (!data || !data.session) { _loadingOlder = false; return; }
     //  - response shape sane
@@ -2791,7 +2994,10 @@ async function _loadOlderMessages() {
       // Race fallback: keep the legacy index-page request as the
       // correctness-preserving alternative. Same guards reapplied because
       // we just awaited again.
-      const fallback = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`);
+      const fallback = await api(
+        `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`,
+        {timeoutMs:120000}
+      );
       if (!fallback || !fallback.session) { _loadingOlder = false; return; }
       if (!S.session || S.session.session_id !== sid) return;
       if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
@@ -2935,7 +3141,10 @@ async function _ensureAllMessagesLoaded() {
   }
 }
 
+const SESSION_ARCHIVED_PAGE_SIZE = 100;
+const SESSION_ARCHIVED_MAX_LOADED_LIMIT = 2000;
 let _allSessions = [];  // cached for search filter
+let _sidebarReferenceSessions = [];  // hidden archived ancestor rows used only for nesting/suppression
 let _allSessionsScope = null;  // {profile, allProfiles} the cache was loaded under (#4167)
 let _sessionAttentionSoundPrimed = false;
 const _sessionAttentionSoundState = new Map();
@@ -2956,6 +3165,7 @@ let _showAllProfiles = false;  // false = filter to active profile only
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
 let _archivedWebuiCount = 0;      // archived WebUI sessions not fetched until requested
 let _archivedCliCount = 0;        // archived non-WebUI sessions not fetched until requested
+let _archivedRowsLoadedLimit = SESSION_ARCHIVED_PAGE_SIZE;
 let _serverWebuiSessionCount = null;  // explicit server count for WebUI sessions
 let _serverCliSessionCount = null;    // explicit server count for CLI sessions
 let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
@@ -3131,6 +3341,38 @@ function _sessionIdFromLocation(){
     return qs.get('session')||qs.get('session_id')||null;
   }catch(_e){return null;}
 }
+function _composerPrefillIntentFromLocation(){
+  const empty={hasParams:false,hasText:false,text:'',autoSend:false};
+  if(typeof window==='undefined'||!window.location) return empty;
+  try{
+    const qs=new URLSearchParams(window.location.search||'');
+    const hasQ=qs.has('q');
+    const hasPrompt=qs.has('prompt');
+    const hasSend=qs.has('send');
+    if(!hasQ&&!hasPrompt&&!hasSend) return empty;
+    const text=hasQ?(qs.get('q')||''):(hasPrompt?(qs.get('prompt')||''):'');
+    return {
+      hasParams:true,
+      hasText:!!String(text).trim(),
+      text,
+      autoSend:false
+    };
+  }catch(_e){return empty;}
+}
+function _consumeComposerPrefillParamsFromLocation(){
+  if(typeof window==='undefined'||!window.location||!window.history||typeof window.history.replaceState!=='function') return;
+  try{
+    const current=new URL(window.location.href);
+    const before=current.searchParams.toString();
+    current.searchParams.delete('q');
+    current.searchParams.delete('prompt');
+    current.searchParams.delete('send');
+    const after=current.searchParams.toString();
+    if(after===before) return;
+    const next=current.pathname+(after?`?${after}`:'')+(current.hash||'');
+    window.history.replaceState(window.history.state||null,'',next);
+  }catch(_e){}
+}
 function _appRootPath(){
   try{
     const base = new URL(document.baseURI||window.location.origin+'/', window.location.origin);
@@ -3146,6 +3388,9 @@ function _sessionUrlForSid(sid){
     const current=new URL(window.location.href);
     current.searchParams.delete('session');
     current.searchParams.delete('session_id');
+    current.searchParams.delete('q');
+    current.searchParams.delete('prompt');
+    current.searchParams.delete('send');
     base.search=current.searchParams.toString();
     base.hash=current.hash;
   }catch(_e){}
@@ -3542,6 +3787,25 @@ function _appendSessionDuplicateAction(menu, session){
   ));
 }
 
+function _appendSessionExportHtmlAction(menu, session){
+  // Per-conversation "Export as HTML" — the sidebar ⋮ menu is the app's uniform
+  // home for per-conversation actions (matches ChatGPT / Open WebUI). Operates
+  // on THIS row's session, not just the active one; the export endpoint accepts
+  // any session_id in the active profile and is non-mutating, so it's offered
+  // for read-only/imported sessions too. exportSessionHTML(session) is a global
+  // defined in boot.js (loaded after sessions.js under defer, so it's bound by
+  // the time this click can fire).
+  menu.appendChild(_buildSessionAction(
+    t('session_export_html'),
+    t('session_export_html_desc'),
+    ICONS.download,
+    ()=>{
+      closeSessionActionMenu();
+      if(typeof exportSessionHTML==='function') exportSessionHTML(session);
+    }
+  ));
+}
+
 function _playSessionActionMenuEntrance(menu){
   if(!menu) return;
   const reduce=_sessionPrefersReducedMotion();
@@ -3597,6 +3861,7 @@ function _openSessionActionMenu(session, anchorEl){
   menu.className='session-action-menu';
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly){
+    _appendSessionExportHtmlAction(menu, session);
     _mountSessionActionMenu(menu, session, anchorEl);
     return;
   }
@@ -3688,6 +3953,7 @@ function _openSessionActionMenu(session, anchorEl){
   if(!isExternalSession){
     _appendSessionDuplicateAction(menu, session);
   }
+  _appendSessionExportHtmlAction(menu, session);
   if(session.active_stream_id){
     menu.appendChild(_buildSessionAction(
       t('session_stop_response'),
@@ -3710,7 +3976,10 @@ function _openSessionActionMenu(session, anchorEl){
       closeSessionActionMenu();
       try{
         if(typeof showToast==='function') showToast(t('session_title_regenerating'), 1600);
-        const response=await api('/api/session/title/regenerate',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+        const requestOpts={method:'POST',body:JSON.stringify({session_id:session.session_id})};
+        const timeoutMs=await _manualTitleRegenerateTimeoutMs();
+        if(timeoutMs) requestOpts.timeoutMs=timeoutMs;
+        const response=await api('/api/session/title/regenerate',requestOpts);
         const nextTitle=(response&&response.title)||(response&&response.session&&response.session.title)||'';
         if(nextTitle){
           session.title=nextTitle;
@@ -3746,7 +4015,11 @@ function _openSessionActionMenu(session, anchorEl){
       ICONS.trash,
       async()=>{
         closeSessionActionMenu();
-        await deleteSession(session.session_id);
+        // Menu Delete has no swipe/removal animation to wait for. Pass an
+        // immediate beforeDelete hook so deleteSession() removes the sidebar row
+        // optimistically while slow backend cleanup (/api/session/delete,
+        // state.db/FTS/journal cleanup) continues.
+        await deleteSession(session.session_id,()=>Promise.resolve());
       },
       'danger'
     ));
@@ -4081,6 +4354,9 @@ function _applySessionListPayload(sessData, projData){
   const serverSessions=_optimisticallyRemovedSessionIds.size
     ? (sessData.sessions||[]).filter(s=>s&&!_optimisticallyRemovedSessionIds.has(s.session_id))
     : (sessData.sessions||[]);
+  _sidebarReferenceSessions = Array.isArray(sessData.sidebar_reference_sessions)
+    ? sessData.sidebar_reference_sessions
+    : [];
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
   // Tag the cache with the scope it was loaded under (active profile +
@@ -4163,13 +4439,21 @@ async function _runRenderSessionListRefresh(opts, _gen){
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
     const sessionListQS = _sessionListQueryString();
+    // #5394: the sidebar session-list GET is idempotent, so 502/503/504 retry
+    // must be unconditional. Previously retries/retryStatuses were boot-gated, so
+    // a transient 502 during an nginx->backend restart on a warm refresh (profile
+    // switch, focus/visible/reconnect) failed on the first attempt and left the
+    // sidebar stale until a hard reload. Boot still keeps the larger timeout +
+    // timeout retry; every refresh now retries the transient upstream statuses.
     const sessionRequestOpts={
       timeoutToast:false,
-      timeoutMs:_sessionListHasLoadedOnce?30000:_SESSION_LIST_BOOT_TIMEOUT_MS,
       retries:1,
-      retryTimeouts:true,
       retryStatuses:[502,503,504],
     };
+    if(!_sessionListHasLoadedOnce){
+      sessionRequestOpts.timeoutMs=_SESSION_LIST_BOOT_TIMEOUT_MS;
+      sessionRequestOpts.retryTimeouts=true;
+    }
     const {sessData, projData}=await _loadSidebarSessionListPayload(sessionListQS, sessionRequestOpts);
     // Discard stale response — a newer renderSessionList() call superseded us.
     if (_gen !== _renderSessionListGen) return;
@@ -4217,6 +4501,7 @@ async function _runRenderSessionListRefresh(opts, _gen){
       renderSessionListFromCache();
     } else {
       _allSessions = [];
+      _sidebarReferenceSessions = [];
       _allSessionsScope = _curScope;
       _clearSessionSourceTabCounts();
       renderSessionListFromCache();
@@ -4235,9 +4520,7 @@ async function _loadSidebarSessionListPayload(sessionListQS, sessionRequestOpts)
     }
   })();
 
-  const sessData = _sessionListHasLoadedOnce
-    ? await api('/api/sessions' + sessionListQS,{timeoutToast:false})
-    : await api('/api/sessions' + sessionListQS,sessionRequestOpts);
+  const sessData = await api('/api/sessions' + sessionListQS,sessionRequestOpts);
   const projData = await projectPromise;
 
   return {sessData,projData};
@@ -4280,7 +4563,7 @@ let _gatewayPollTimer = null;
 let _gatewayProbeInFlight = false;
 let _gatewaySSEWarningShown = false;
 const _gatewayFallbackPollMs = 30000;
-const _streamingPollMs = 5000;
+const _streamingPollMs = 30000;
 const _sessionTimeRefreshMs = 60000;
 // #3107: the active-session "is it externally updated?" poll used to fire
 // every 5 s. On long sessions this caused visible scroll jitter and a
@@ -4419,7 +4702,23 @@ async function refreshActiveSessionIfExternallyUpdated(reason){
     // list metadata, advancing the local last-seen marker so the same metadata
     // bump doesn't re-trigger on every subsequent poll.
     if(remoteCount !== localCount){
-      await loadSession(sid, {force:true, externalRefreshReason:reason||'poll'});
+      // Hidden-tab return / visibility / focus recovery commonly trips
+      // remoteCount !== localCount when the post-turn bg-review thread or a
+      // sibling tab persisted messages while the tab was hidden. The default
+      // loadSession(force) path clears S.messages synchronously and waits for
+      // the full transcript round-trip before re-rendering, producing the
+      // user-visible "everything disappears, then reappears after a moment"
+      // gap that #5061 (metadata-only) and #5122 (SSE 4-probe) DO NOT cover
+      // (#5177). Pass keepStaleUntilLoaded so the destructive clear is
+      // deferred to swap-in-place when the new transcript actually arrives.
+      // Restrict to the recovery reasons that produced the field repro; the
+      // post-stream idle reconcile and external/imported-session polls keep
+      // the original behaviour (no DOM is on-screen long enough for the gap
+      // to matter, and any change there would have to re-verify their own
+      // tradeoffs).
+      const _recoveryReasons = {visible:true, focus:true};
+      const _keepStaleUntilLoaded = !!_recoveryReasons[String(reason||'')];
+      await loadSession(sid, {force:true, externalRefreshReason:reason||'poll', keepStaleUntilLoaded:_keepStaleUntilLoaded});
       if(typeof renderSessionList==='function') void renderSessionList();
       return 'reloaded';
     }else if(remoteLast > localLast){
@@ -4812,6 +5111,7 @@ let _searchDebounceTimer = null;
 let _contentSearchResults = [];  // results from /api/sessions/search content scan
 let _lastSessionSearchQuery = '';
 let _hideSearchPreviewsAfterSelect = false;
+let _archivedSearchPagingQueryActive = false;
 let _serverTimeDelta = 0;       // ms offset: client clock - server clock (for clock-skew compensation)
 let _serverTz = '';              // server timezone offset string (e.g. "+0800", "+0000", "-0500")
 
@@ -4976,11 +5276,23 @@ function clearSessionSearch(focusInput=true){
   if(focusInput) input.focus();
 }
 
+function _syncArchivedSearchPagingRefresh(query){
+  const queryActive=Boolean(String(query||'').trim());
+  const previous=_archivedSearchPagingQueryActive;
+  _archivedSearchPagingQueryActive=queryActive;
+  if(!_showArchived||queryActive===previous) return;
+  // Archived title/id filtering is client-side. When search becomes active,
+  // refetch without archived_limit so matches beyond the first archived page are
+  // reachable; when search clears, refetch again to restore normal archive paging.
+  if(typeof renderSessionList==='function') void renderSessionList({deferWhileInteracting:false});
+}
+
 function filterSessions(){
   // Immediate client-side title filter (no flicker)
   // Debounced content search via API for message text
   syncSessionSearchClear();
   const q = ($('sessionSearch').value || '').trim();
+  _syncArchivedSearchPagingRefresh(q);
   if(q!==_lastSessionSearchQuery){
     _lastSessionSearchQuery=q;
     _hideSearchPreviewsAfterSelect=false;
@@ -5489,10 +5801,6 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     const childLineageKey=child&&(child._lineage_root_id||child.lineage_root_id||child.parent_session_id);
     const isHiddenLineageReferenceChild=!!(child&&child.archived&&child.parent_session_id&&childLineageKey&&!child.pinned&&!childRenderable);
     if(!_isChildSession(child)&&!isForkChild&&!isHiddenLineageReferenceChild) continue;
-    if(!isForkChild&&child._cross_surface_child_session){
-      if(childRenderable) orphans.push({...child,_orphan_child_session:true});
-      continue;
-    }
     const parentSid=child.parent_session_id;
     let parentRow=visibleBySid.get(parentSid);
     let parentSegment=null;
@@ -5511,6 +5819,25 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       hiddenArchivedChildTree.add(child.session_id);
       continue;
     }
+    // Cross-surface rows (for example a WebUI continuation from a Telegram
+    // conversation) should remain top-level when there is no WebUI-owned parent
+    // row to stack under.  But if the parent is visible in this same sidebar
+    // render, attach normally — delegated subagent rows are also cross-source
+    // relative to their WebUI parent and should not be forced into orphans.
+    const parentSourceMarker=String(parentRow&&(
+      parentRow.session_source||parentRow.raw_source||parentRow.source_tag||parentRow.source
+    )||'').toLowerCase();
+    const parentIsExternal=parentRow&&(
+      (typeof _isExternalSession==='function'&&_isExternalSession(parentRow))||
+      (typeof _isMessagingSession==='function'&&_isMessagingSession(parentRow))||
+      parentRow.is_cli_session===true||
+      parentRow.session_source==='messaging'||
+      (parentSourceMarker&&parentSourceMarker!=='webui'&&parentSourceMarker!=='subagent'&&parentSourceMarker!=='other'&&parentSourceMarker!=='fork')
+    );
+    if(parentRow&&child._cross_surface_child_session&&parentIsExternal){
+      if(childRenderable) orphans.push({...child,_orphan_child_session:true});
+      continue;
+    }
     if(parentRow){
       const childCopy={...child};
       if(parentSegment){
@@ -5525,6 +5852,19 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       bubbleSidebarState(parentRow, childCopy);
       visibleBySegmentSid.set(childCopy.session_id,{row: parentRow, seg: childCopy});
     } else if(childRenderable) {
+      // #5305: a delegated subagent child whose WebUI parent is NOT a visible
+      // row in this render (filtered out by the active project / profile / source
+      // scope, or otherwise absent) must NOT be promoted to a contextless
+      // top-level "Subagent Session" orphan — that is the confusing orphan #5244
+      // set out to remove for the common case. The parent still exists; it is
+      // simply out of the current view, so the child follows its parent's scope
+      // and is suppressed here (it re-stacks under the parent once that scope is
+      // active). This mirrors the archived-hidden-parent suppression above
+      // (hasHiddenArchivedAncestor / #4293), generalizing the "parent hidden"
+      // trigger from archived to filtered-out. A cross-surface WebUI child of a
+      // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
+      // branch above and still orphans as before.
+      if(child&&child._cross_surface_child_session&&_isChildSession(child)) continue;
       orphans.push({...child,_orphan_child_session:true});
     }
   }
@@ -5848,6 +6188,15 @@ function _sidebarRowHasVisibleMessages(s, activeSidForSidebar){
     !!s.pending_user_message ||
     !!s.has_pending_user_message ||
     (activeSidForSidebar&&s.session_id===activeSidForSidebar) ||
+    // #5306: a linked delegate child of the currently-active/streaming parent
+    // must stay rendered for the duration of the parent's turn. A subagent child
+    // that transiently reports message_count===0 between /api/sessions polls would
+    // otherwise be dropped HERE (before _attachChildSessionsToSidebarRows ever sees
+    // it), so it never reaches sessionsRaw, vanishes from the sidebar, then
+    // reappears on the next refresh once its list metadata catches up — the flicker.
+    // Scoped to children of the ACTIVE parent, mirroring the active-session
+    // exception above, so unrelated truly-empty sessions are still hidden.
+    (activeSidForSidebar&&s.parent_session_id===activeSidForSidebar&&_isChildSession(s)) ||
     (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0);
 }
 
@@ -5900,9 +6249,80 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   };
 }
 
+// Hidden archived-ancestor reference rows (sidebar_reference_sessions) arrive
+// from /api/sessions WITHOUT the client-side project/source scoping that
+// _partitionSidebarSessionRows applies to the visible rows. Appending them to
+// EVERY render unconditionally let an archived parent from a DIFFERENT project
+// (or the other source bucket) enter a project/source-filtered render's
+// suppression context — silently hiding a visible child/fork whose archived
+// ancestor lives outside the current view. Scope the references to the same
+// project + source bucket as the render they feed before using them.
+function _scopedSidebarReferenceRows(isCli){
+  if(typeof _sidebarReferenceSessions==='undefined'||!Array.isArray(_sidebarReferenceSessions)||!_sidebarReferenceSessions.length) return [];
+  return _sidebarReferenceSessions.filter(s=>{
+    if(!s) return false;
+    // Source scope: only references in the same webui/cli bucket as this render.
+    if(_isCliSession(s)!==!!isCli) return false;
+    // Project scope: mirror _partitionSidebarSessionRows exactly.
+    if(_activeProject===NO_PROJECT_FILTER){ if(s.project_id) return false; }
+    else if(_activeProject){ if(s.project_id!==_activeProject) return false; }
+    return true;
+  });
+}
+
 function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
   const referenceRows=Array.isArray(referenceSessionsRaw)?referenceSessionsRaw:sessionsRaw;
   return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
+}
+
+function _attachProjectQuickCreateButton(chip, project){
+  const btn=document.createElement('button');
+  btn.type='button';
+  btn.className='project-chip-quick-create';
+  btn.textContent='+';
+  btn.title='New conversation in this project';
+  btn.setAttribute('aria-label','New conversation in this project');
+  const stop=function(e){
+    if(!e) return;
+    if(typeof e.preventDefault==='function') e.preventDefault();
+    if(typeof e.stopPropagation==='function') e.stopPropagation();
+    if(typeof e.stopImmediatePropagation==='function') e.stopImmediatePropagation();
+  };
+  const stopTouchBubble=function(e){
+    if(!e) return;
+    if(typeof e.stopPropagation==='function') e.stopPropagation();
+    if(typeof e.stopImmediatePropagation==='function') e.stopImmediatePropagation();
+  };
+  btn.onclick=async(e)=>{
+    stop(e);
+    if(_newSessionInFlight){
+      // The initiating tap already owns the filter change and rollback path.
+      try{
+        await newSession(false,{project_id:project.project_id});
+      }catch(_){
+        // The initiating tap already owns the visible failure path.
+      }
+      return;
+    }
+    const previousProject=(typeof _activeProject!=='undefined')?_activeProject:NO_PROJECT_FILTER;
+    _setActiveProjectFilter(project.project_id);
+    try{
+      await newSession(false,{project_id:project.project_id});
+      // newSession() does not repaint the sidebar (callers own that — see the
+      // newSession contract). Repaint from the post-create state so the new
+      // project-assigned session appears deterministically.
+      try{ if(typeof renderSessionListFromCache==='function') renderSessionListFromCache(); }catch(_){}
+      try{ if(typeof renderSessionList==='function') void renderSessionList({deferWhileInteracting:false}); }catch(_){}
+    }catch(err){
+      _setActiveProjectFilter(previousProject);
+      if(typeof showToast==='function') showToast('New conversation failed: '+(err&&err.message||err));
+    }
+  };
+  btn.ondblclick=(e)=>{stop(e);};
+  btn.oncontextmenu=(e)=>{stop(e);};
+  btn.ontouchstart=(e)=>{stopTouchBubble(e);};
+  btn.ontouchend=(e)=>{stopTouchBubble(e);};
+  chip.appendChild(btn);
 }
 
 
@@ -5947,9 +6367,18 @@ function renderSessionListFromCache(){
     cliSessionsRaw,
   }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
   const referenceRaw=_sessionSourceFilter==='cli'?cliReferenceRaw:webuiReferenceRaw;
-  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, referenceRaw);
-  const renderedWebuiSessionCount=_renderSidebarRowsFromRawSessions(webuiSessionsRaw, webuiReferenceRaw).length;
-  const renderedCliSessionCount=_renderSidebarRowsFromRawSessions(cliSessionsRaw, cliReferenceRaw).length;
+  const isCliView=_sessionSourceFilter==='cli';
+  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView)]);
+  // Server-provided source bucket counts are authoritative for the current
+  // payload. When present, skip the expensive cross-bucket render/count pass;
+  // null is a deliberate "not computed" sentinel consumed only by
+  // _sessionSourceTabCount's fallback path below.
+  const renderedWebuiSessionCount=_serverWebuiSessionCount===null
+    ? _renderSidebarRowsFromRawSessions(webuiSessionsRaw, [...webuiReferenceRaw, ..._scopedSidebarReferenceRows(false)]).length
+    : null;
+  const renderedCliSessionCount=_serverCliSessionCount===null
+    ? _renderSidebarRowsFromRawSessions(cliSessionsRaw, [...cliReferenceRaw, ..._scopedSidebarReferenceRows(true)]).length
+    : null;
   const webuiSessionTabCount=_sessionSourceTabCount('webui', renderedWebuiSessionCount, renderedCliSessionCount);
   const cliSessionTabCount=_sessionSourceTabCount('cli', renderedWebuiSessionCount, renderedCliSessionCount);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
@@ -6110,6 +6539,7 @@ function renderSessionListFromCache(){
         clearTimeout(_lpTimer);_lpTimer=null;_lpHandled=false;
         chip.classList.remove('long-pressing');
       },{passive:true});
+      if(window._projectQuickCreate) _attachProjectQuickCreateButton(chip,p);
       bar.appendChild(chip);
     }
     // Create button
@@ -6146,7 +6576,11 @@ function renderSessionListFromCache(){
     const toggle=document.createElement('div');
     toggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
     toggle.textContent=_showArchived?'Hide archived':'Show '+archivedCount+' archived';
-    toggle.onclick=()=>{_showArchived=!_showArchived;renderSessionList();};
+    toggle.onclick=()=>{
+      _showArchived=!_showArchived;
+      if(_showArchived) _archivedRowsLoadedLimit=SESSION_ARCHIVED_PAGE_SIZE;
+      renderSessionList();
+    };
     list.appendChild(toggle);
   }
   // Empty state for active project filter
@@ -6294,6 +6728,27 @@ function renderSessionListFromCache(){
     // when the list scrolls naturally. Fixed for #1669 follow-up.
     list.scrollTop=listScrollTopBeforeRender;
     _resyncSessionVirtualWindowAfterRender(list, listScrollTopBeforeRender, virtualWindow);
+  }
+  const archivePagingFilterActive=_sessionArchivePagingFilterActive();
+  if(_showArchived&&!archivePagingFilterActive){
+    const activeArchivedTotal=_sessionSourceFilter==='cli'?_archivedCliCount:_archivedWebuiCount;
+    const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived&&(_sessionSourceFilter==='cli'?_isCliSession(s):!_isCliSession(s))).length;
+    const archiveLoadCapReached=Number(_archivedRowsLoadedLimit||0)>=SESSION_ARCHIVED_MAX_LOADED_LIMIT;
+    const remainingArchived=archiveLoadCapReached?0:Math.max(0, Number(activeArchivedTotal||0)-loadedArchivedCount);
+    if(remainingArchived>0){
+      const more=document.createElement('div');
+      more.className='session-archive-more';
+      more.style.cssText='font-size:10px;padding:6px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.8;';
+      more.textContent='Load '+Math.min(SESSION_ARCHIVED_PAGE_SIZE, remainingArchived)+' more archived ('+remainingArchived+' remaining)';
+      more.onclick=()=>{
+        _archivedRowsLoadedLimit=Math.min(
+          SESSION_ARCHIVED_MAX_LOADED_LIMIT,
+          Math.max(SESSION_ARCHIVED_PAGE_SIZE, Number(_archivedRowsLoadedLimit)||SESSION_ARCHIVED_PAGE_SIZE)+SESSION_ARCHIVED_PAGE_SIZE
+        );
+        renderSessionList();
+      };
+      list.appendChild(more);
+    }
   }
   // Select mode toggle button (only when NOT in select mode)
   if(!_sessionSelectMode){

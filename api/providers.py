@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - exercised only where fcntl is unavaila
 from api.config import (
     _PROVIDER_DISPLAY,
     _PROVIDER_MODELS,
+    _coerce_provider_cost_budget,
     _custom_provider_slug_from_name,
     _get_label_for_model,
     _models_from_live_provider_ids,
@@ -701,6 +702,7 @@ _PROVIDER_ENV_VAR: dict[str, str] = {
     "mistralai": "MISTRAL_API_KEY",
     "x-ai": "XAI_API_KEY",
     "xiaomi": "XIAOMI_API_KEY",
+    "neuralwatt": "NEURALWATT_API_KEY",
     "opencode-zen": "OPENCODE_ZEN_API_KEY",
     "opencode-go": "OPENCODE_GO_API_KEY",
     # NOTE: bare "ollama" (local) deliberately omitted — local Ollama is keyless
@@ -2050,6 +2052,16 @@ _COST_SNAPSHOT_MAX_DAYS = 365  # hard cap to prevent unbounded growth
 _COST_SNAPSHOT_LOCK = threading.Lock()
 
 
+def _get_provider_cost_budget() -> float | None:
+    """Return the user-configured monthly spend budget, or None if unset."""
+    try:
+        from api.config import load_settings
+        raw = load_settings().get("provider_cost_budget")
+        return _coerce_provider_cost_budget(raw)
+    except Exception:
+        return None
+
+
 def _cost_snapshots_dir() -> Path:
     """Return the directory for cost-snapshot JSON files.
 
@@ -2269,6 +2281,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
         }
 
     display_name = _PROVIDER_DISPLAY.get("openrouter", "OpenRouter")
+    monthly_budget = _get_provider_cost_budget()
     api_key = _get_provider_api_key("openrouter")
     if not api_key:
         return {
@@ -2277,6 +2290,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
             "display_name": display_name,
             "supported": True,
             "status": "no_key",
+            "monthly_budget": monthly_budget,
             "message": "OpenRouter cost history needs an OPENROUTER_API_KEY configured on the server.",
         }
 
@@ -2297,6 +2311,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
             "snapshots": deltas,
             "limit": None,
             "label": None,
+            "monthly_budget": monthly_budget,
             "message": "OpenRouter cost history is temporarily unavailable. Showing last known data.",
         }
 
@@ -2318,6 +2333,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
         "snapshots": deltas,
         "limit": key_info.get("limit"),
         "label": key_info.get("label") or "OpenRouter credits",
+        "monthly_budget": monthly_budget,
         "message": "OpenRouter cost history loaded.",
     }
 
