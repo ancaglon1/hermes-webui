@@ -5921,8 +5921,106 @@ async function switchToWorkspace(path,name){
 
 // ── Profile panel + dropdown ──
 let _profilesCache = null;
+let _profileDropdownFetchPromise = null;
+let _profileDropdownCacheLoadedFromStorage = false;
+const PROFILE_DROPDOWN_CACHE_KEY = 'hermes-webui-profile-dropdown-cache-v1';
+const PROFILE_DROPDOWN_CACHE_TTL_MS = 5 * 60 * 1000;
 let _profileSwitchGeneration = 0;
 let _profileDropdownTrigger = null;  // tracks which element triggered the dropdown
+let _profileDropdownOpenGeneration = 0;
+
+function _profileDropdownClearStoredCache(){
+  try{localStorage.removeItem(PROFILE_DROPDOWN_CACHE_KEY);}catch(_){}
+}
+
+function _profileDropdownDataCacheUsable(data){
+  return !!(
+    data &&
+    Array.isArray(data.profiles) &&
+    data.profiles.length &&
+    data.profiles.every(p=>
+      p &&
+      typeof p.name==='string' &&
+      // Renderer-read fields must be safe types: renderProfileDropdown /
+      // renderProfilesPanel call p.model.split('/') guarded only by truthiness,
+      // so a poisoned cached row like {name:"x", model:{}} would pass a
+      // name-only check yet throw synchronously on dropdown open (bricking
+      // profile switching). Reject rows whose model is a non-string truthy value.
+      (p.model==null || typeof p.model==='string')
+    )
+  );
+}
+
+function _profileDropdownCacheUsable(data){
+  return !!(_profileDropdownDataCacheUsable(data) && data.single_profile_mode !== true);
+}
+
+function _profileDropdownReadStoredCache(){
+  if(_profileDropdownCacheLoadedFromStorage) return _profileDropdownCacheUsable(_profilesCache) ? _profilesCache : null;
+  _profileDropdownCacheLoadedFromStorage = true;
+  try{
+    const raw=localStorage.getItem(PROFILE_DROPDOWN_CACHE_KEY);
+    if(!raw) return null;
+    const parsed=JSON.parse(raw);
+    if(!parsed || typeof parsed.ts!=='number' || !parsed.data) { _profileDropdownClearStoredCache(); return null; }
+    if(Date.now()-parsed.ts>PROFILE_DROPDOWN_CACHE_TTL_MS) { _profileDropdownClearStoredCache(); return null; }
+    if(!_profileDropdownCacheUsable(parsed.data)) { _profileDropdownClearStoredCache(); return null; }
+    _profilesCache = parsed.data;
+    return _profilesCache;
+  }catch(_){_profileDropdownClearStoredCache();return null;}
+}
+
+function _profileDropdownWriteStoredCache(data){
+  if(!_profileDropdownCacheUsable(data)) { _profileDropdownClearStoredCache(); return; }
+  try{localStorage.setItem(PROFILE_DROPDOWN_CACHE_KEY, JSON.stringify({ts:Date.now(), data}));}catch(_){}
+}
+
+function _profileDropdownBestCachedData(){
+  if(_profileDropdownCacheUsable(_profilesCache)) return _profilesCache;
+  if(_profileDropdownDataCacheUsable(_profilesCache)) return null;
+  _profilesCache = null;
+  return _profileDropdownReadStoredCache();
+}
+
+function _profileDropdownFetchFresh(){
+  if(_profileDropdownFetchPromise) return _profileDropdownFetchPromise;
+  _profileDropdownFetchPromise = api('/api/profiles', {timeoutToast:false}).then(data=>{
+    if(_profileDropdownDataCacheUsable(data)) _profilesCache = data;
+    _profileDropdownWriteStoredCache(data);
+    return data;
+  }).finally(()=>{ _profileDropdownFetchPromise = null; });
+  return _profileDropdownFetchPromise;
+}
+
+function _warmProfileDropdownCache(){
+  _profileDropdownBestCachedData();
+  _profileDropdownFetchFresh().catch(()=>{});
+}
+
+if(typeof window!=='undefined'){
+  window.addEventListener('load',()=>{
+    setTimeout(()=>{
+      if(typeof document==='undefined'||!document.hidden) _warmProfileDropdownCache();
+    },1200);
+  },{once:true});
+}
+
+function _renderProfileDropdownLoading(){
+  const dd=$('profileDropdown');
+  if(!dd)return;
+  dd.innerHTML=`<div class="profile-opt profile-opt-loading"><div class="profile-opt-name">${esc(t('loading')||'Loading...')}</div></div>`;
+}
+
+function _openProfileDropdownShell(){
+  const dd=$('profileDropdown');
+  if(!dd)return;
+  dd.classList.add('open');
+  _positionProfileDropdown();
+  const chip=$('profileChip');
+  if(chip && _profileDropdownTrigger===chip) chip.classList.add('active');
+  const tbtn=$('titlebarProfileBtn');
+  if(tbtn && _profileDropdownTrigger===tbtn) tbtn.classList.add('active');
+}
 
 async function _profileSwitchPanelLoad(){
   // Cross-profile cron visibility is an active-profile opt-in; never carry it
@@ -5983,6 +6081,7 @@ async function loadProfilesPanel() {
   try {
     const data = await api('/api/profiles');
     _profilesCache = data;
+    _profileDropdownWriteStoredCache(data);
     panel.innerHTML = '';
 
     // Hide "New profile" button in single profile mode
@@ -6022,7 +6121,7 @@ async function loadProfilesPanel() {
       card.className = 'profile-card';
       card.dataset.name = p.name;
       const meta = [];
-      if (p.model) meta.push(p.model.split('/').pop());
+      if (typeof p.model === 'string' && p.model) meta.push(p.model.split('/').pop());
       if (p.provider) meta.push(p.provider);
       if (p.total_skills && p.total_skills > 0) meta.push(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`));
       const gwDot = p.gateway_running
@@ -6188,10 +6287,11 @@ async function deleteCurrentProfile(){
 }
 
 function renderProfileDropdown(data) {
+  data = data || {};
   const dd = $('profileDropdown');
   if (!dd) return;
   dd.innerHTML = '';
-  const allProfiles = data.profiles || [];
+  const allProfiles = (Array.isArray(data.profiles) ? data.profiles : []).filter(p => p && typeof p.name === 'string');
   const active = (S.activeProfile && allProfiles.some(p => p.name === S.activeProfile))
     ? S.activeProfile
     : (data.active || 'default');
@@ -6200,7 +6300,7 @@ function renderProfileDropdown(data) {
     const opt = document.createElement('div');
     opt.className = 'profile-opt' + (p.name === active ? ' active' : '');
     const meta = [];
-    if (p.model) meta.push(p.model.split('/').pop());
+    if (typeof p.model === 'string' && p.model) meta.push(p.model.split('/').pop());
     if (p.total_skills && p.total_skills > 0) meta.push(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`));
     const gwDot = `<span class="profile-opt-badge ${p.gateway_running ? 'running' : 'stopped'}"></span>`;
     const checkmark = p.name === active ? ' <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--link)" stroke-width="3" style="vertical-align:-1px"><polyline points="20 6 9 17 4 12"/></svg>' : '';
@@ -6235,24 +6335,39 @@ function toggleProfileDropdown(e) {
   if(typeof closeModelDropdown==='function') closeModelDropdown();
   // Track which element triggered the dropdown for positioning
   _profileDropdownTrigger = (e && e.currentTarget) || $('profileChip');
-  api('/api/profiles').then(data => {
+  const openGen = ++_profileDropdownOpenGeneration;
+  const cached = _profileDropdownBestCachedData();
+
+  if(cached && !cached.single_profile_mode){
+    renderProfileDropdown(cached);
+    _openProfileDropdownShell();
+  }else{
+    _renderProfileDropdownLoading();
+    _openProfileDropdownShell();
+  }
+
+  _profileDropdownFetchFresh().then(data => {
+    if(openGen !== _profileDropdownOpenGeneration) return;
     // In single profile mode, don't show profile dropdown at all
     if (data.single_profile_mode) {
       closeProfileDropdown();
       return;
     }
     renderProfileDropdown(data);
-    dd.classList.add('open');
-    _positionProfileDropdown();
-    // Mark the triggering button as active
-    const chip=$('profileChip');
-    if(chip && _profileDropdownTrigger===chip) chip.classList.add('active');
-    const tbtn=$('titlebarProfileBtn');
-    if(tbtn && _profileDropdownTrigger===tbtn) tbtn.classList.add('active');
-  }).catch(e => { showToast(t('profiles_load_failed')); });
+    _openProfileDropdownShell();
+  }).catch(e => {
+    if(openGen !== _profileDropdownOpenGeneration) return;
+    if(cached && !cached.single_profile_mode){
+      // Keep the cached menu open; the next click/background refresh will retry.
+      return;
+    }
+    closeProfileDropdown();
+    showToast(t('profiles_load_failed'));
+  });
 }
 
 function closeProfileDropdown() {
+  _profileDropdownOpenGeneration++;
   const dd = $('profileDropdown');
   if (dd) dd.classList.remove('open');
   const chip=$('profileChip');
@@ -9823,7 +9938,11 @@ async function _loadPluginPage(path, label) {
 
 // ── Providers panel ─────────────────────────────────────────────────────────
 
-const _providerCardEls = new Map(); // providerId → {card, statusDot, input, saveBtn, removeBtn}
+const _providerCardEls = new Map(); // providerId → entry used by save/remove/test handlers
+const _SELF_HOSTED_DEFAULT_BASE_URLS = Object.freeze({
+  ollama: 'http://localhost:11434/v1',
+  lmstudio: 'http://localhost:1234/v1',
+});
 
 async function _fetchProviderQuotaStatus(force=false){
   const endpoint=force?`/api/provider/quota?refresh=1&ts=${Date.now()}`:'/api/provider/quota';
@@ -9839,7 +9958,7 @@ async function loadProvidersPanel(){
   try{
     const data=await api('/api/providers');
     const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
-    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider);
+    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider||p.is_self_hosted);
     list.innerHTML='';
     _providerCardEls.clear();
     const quotaCard=_buildProviderQuotaCard(quota);
@@ -10315,7 +10434,140 @@ function _buildProviderCard(p){
   }
 
   let input=null;
+  let focusInput=null;
   let saveBtn=null;
+  if(p.is_self_hosted){
+    const defaultBaseUrl=_SELF_HOSTED_DEFAULT_BASE_URLS[p.id];
+    const baseUrlField=document.createElement('div');
+    baseUrlField.className='provider-card-field';
+    const baseUrlLabel=document.createElement('label');
+    baseUrlLabel.className='provider-card-label';
+    baseUrlLabel.textContent='Base URL';
+    baseUrlField.appendChild(baseUrlLabel);
+    const baseUrlRow=document.createElement('div');
+    baseUrlRow.className='provider-card-row';
+    const baseUrlInput=document.createElement('input');
+    baseUrlInput.type='text';
+    baseUrlInput.className='provider-card-input';
+    baseUrlInput.placeholder=defaultBaseUrl||'http://localhost:11434/v1';
+    baseUrlInput.value=(p.base_url||'').trim()||defaultBaseUrl||'';
+    baseUrlInput.autocomplete='off';
+    const testBtn=document.createElement('button');
+    testBtn.type='button';
+    testBtn.className='provider-card-btn provider-card-btn-ghost';
+    testBtn.textContent='Test connection';
+    const probeStatus=document.createElement('div');
+    probeStatus.className='provider-card-hint';
+    baseUrlRow.appendChild(baseUrlInput);
+    baseUrlRow.appendChild(testBtn);
+    baseUrlField.appendChild(baseUrlRow);
+    baseUrlField.appendChild(probeStatus);
+
+    const keyField=document.createElement('div');
+    keyField.className='provider-card-field';
+    const keyLabel=document.createElement('label');
+    keyLabel.className='provider-card-label';
+    keyLabel.textContent='API key (optional)';
+    keyField.appendChild(keyLabel);
+    const keyRow=document.createElement('div');
+    keyRow.className='provider-card-row';
+    const keyInput=document.createElement('input');
+    keyInput.type='password';
+    keyInput.className='provider-card-input';
+    keyInput.autocomplete='off';
+    keyInput.placeholder='Optional';
+    keyRow.appendChild(keyInput);
+    keyField.appendChild(keyRow);
+
+    const modelField=document.createElement('div');
+    modelField.className='provider-card-field';
+    const modelLabel=document.createElement('label');
+    modelLabel.className='provider-card-label';
+    modelLabel.textContent=t('providers_status_model')||'Model';
+    modelField.appendChild(modelLabel);
+    const modelRow=document.createElement('div');
+    modelRow.className='provider-card-row';
+    const modelInput=document.createElement('input');
+    modelInput.type='text';
+    modelInput.className='provider-card-input';
+    modelInput.autocomplete='off';
+    modelInput.placeholder='model id';
+    const modelDatalist=document.createElement('datalist');
+    const modelListId='providerModelList-'+p.id;
+    modelDatalist.id=modelListId;
+    modelInput.setAttribute('list',modelListId);
+    const setModelChoices=(models)=>{
+      modelDatalist.innerHTML='';
+      const choices=Array.isArray(models)?models:[];
+      for(const model of choices){
+        const modelId=model&&model.id?model.id:model;
+        const option=document.createElement('option');
+        option.value=modelId;
+        modelDatalist.appendChild(option);
+      }
+    };
+    const initialModelChoices=Array.isArray(p.models)?p.models:[];
+    setModelChoices(initialModelChoices);
+
+    const saveRow=document.createElement('div');
+    saveRow.className='provider-card-row';
+    saveRow.style.marginTop='6px';
+    saveBtn=document.createElement('button');
+    saveBtn.type='button';
+    saveBtn.className='provider-card-btn provider-card-btn-primary';
+    saveBtn.textContent=t('providers_save');
+    saveBtn.onclick=()=>_saveSelfHostedProvider(p.id);
+    saveBtn.disabled=true;
+    saveRow.appendChild(saveBtn);
+    if(p.has_key){
+      const removeBtn=document.createElement('button');
+      removeBtn.type='button';
+      removeBtn.className='provider-card-btn provider-card-btn-danger';
+      removeBtn.textContent=t('providers_remove');
+      removeBtn.onclick=()=>_removeProviderKey(p.id);
+      saveRow.appendChild(removeBtn);
+    }
+    modelRow.appendChild(modelInput);
+    modelField.appendChild(modelRow);
+    body.appendChild(baseUrlField);
+    body.appendChild(keyField);
+    body.appendChild(modelField);
+    body.appendChild(saveRow);
+    body.appendChild(modelDatalist);
+    card.appendChild(body);
+
+    const checkSaveEnabled=()=>{
+      const hasUrl=baseUrlInput.value.trim().length>0;
+      const hasModel=modelInput.value.trim().length>0;
+      saveBtn.disabled=!(hasUrl&&hasModel);
+    };
+    baseUrlInput.addEventListener('input',checkSaveEnabled);
+    modelInput.addEventListener('input',checkSaveEnabled);
+    checkSaveEnabled();
+
+    _providerCardEls.set(p.id,{
+      card,
+      baseUrlInput,
+      apiKeyInput:keyInput,
+      modelInput,
+      modelDatalist,
+      saveBtn,
+      testBtn,
+      probeStatus,
+      isSelfHosted:true,
+      setModelChoices,
+      updateSaveState:checkSaveEnabled,
+    });
+    focusInput=modelInput;
+    testBtn.onclick=()=>_testSelfHostedConnection(p.id);
+    header.addEventListener('click',e=>{
+      if(e.target.closest('.provider-card-body')) return;
+      card.classList.toggle('open');
+      if(card.classList.contains('open')) setTimeout(()=>focusInput&&focusInput.focus(),0);
+    });
+    return card;
+  }
+
   if(p.configurable){
     const field=document.createElement('div');
     field.className='provider-card-field';
@@ -10359,6 +10611,8 @@ function _buildProviderCard(p){
     }
     field.appendChild(row);
     body.appendChild(field);
+    focusInput=input;
+
   }else{
     const hint=document.createElement('div');
     hint.className='provider-card-hint';
@@ -10428,7 +10682,7 @@ function _buildProviderCard(p){
     // Don't toggle when clicking inside body (defensive; body isn't inside header)
     if(e.target.closest('.provider-card-body')) return;
     card.classList.toggle('open');
-    if(card.classList.contains('open')) setTimeout(()=>input.focus(),0);
+    if(card.classList.contains('open')) setTimeout(()=>focusInput&&focusInput.focus(),0);
   });
   return card;
 }
@@ -10500,6 +10754,108 @@ async function _removeProviderKey(providerId){
       showToast('Error: '+e.message);
     }
     if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
+  }
+}
+
+async function _testSelfHostedConnection(providerId){
+  const els=_providerCardEls.get(providerId);
+  if(!els||!els.isSelfHosted) return;
+  const baseUrl=(els.baseUrlInput.value||'').trim();
+  const apiKey=(els.apiKeyInput.value||'').trim();
+  if(!baseUrl){
+    showToast('Base URL is required');
+    return;
+  }
+
+  const testBtn=els.testBtn;
+  if(!testBtn) return;
+  const prevLabel=testBtn.textContent;
+  testBtn.disabled=true;
+  testBtn.textContent='Testing...';
+  if(els.probeStatus){
+    els.probeStatus.style.color='var(--muted)';
+    els.probeStatus.textContent='Testing connection...';
+  }
+
+  try{
+    const res=await api('/api/onboarding/probe',{
+      method:'POST',
+      body:JSON.stringify({provider:providerId,base_url:baseUrl,api_key:apiKey||undefined}),
+    });
+    if(res&&res.ok){
+      const models=Array.isArray(res.models)?res.models:[];
+      if(els.setModelChoices){
+        els.setModelChoices(models);
+      }
+      if(els.probeStatus){
+        const count=models.length;
+        els.probeStatus.style.color='var(--ok)';
+        els.probeStatus.textContent=`Connected. ${count} model(s) available.`;
+      }
+      if(!els.modelInput.value&&models.length&&models[0]){
+        els.modelInput.value=models[0].id||models[0];
+      }
+      if(els.updateSaveState){
+        els.updateSaveState();
+      }
+    }else{
+      const err=(res&&res.error)||'unreachable';
+      const detail=(res&&res.detail)?` (${res.detail})`:'';
+      if(els.probeStatus){
+        els.probeStatus.style.color='var(--accent)';
+        els.probeStatus.textContent=`${err}${detail}`;
+      }
+      showToast(`Connection test failed: ${err}`);
+    }
+  }catch(e){
+    if(els.probeStatus){
+      els.probeStatus.style.color='var(--accent)';
+      els.probeStatus.textContent=e&&e.message?e.message:'Connection test failed';
+    }
+    showToast('Connection test failed: '+(e&&e.message||'request error'));
+  }finally{
+    testBtn.disabled=false;
+    testBtn.textContent=prevLabel;
+  }
+}
+
+async function _saveSelfHostedProvider(providerId){
+  const els=_providerCardEls.get(providerId);
+  if(!els||!els.isSelfHosted) return;
+  const baseUrl=(els.baseUrlInput.value||'').trim();
+  const key=(els.apiKeyInput.value||'').trim();
+  const model=(els.modelInput.value||'').trim();
+  if(!baseUrl){
+    showToast('Base URL is required');
+    return;
+  }
+  if(!model){
+    showToast('Model is required');
+    return;
+  }
+  if(!els.saveBtn) return;
+  const saveBtn=els.saveBtn;
+  const prevLabel=saveBtn.textContent;
+  saveBtn.disabled=true;
+  saveBtn.textContent='Saving...';
+  try{
+    const payload={provider:providerId,base_url:baseUrl,model:model};
+    if(key) payload.api_key=key;
+    const res=await api('/api/providers/self-hosted',{method:'POST',body:JSON.stringify(payload)});
+    if(res&&res.ok){
+      showToast(`${res.provider} configured`);
+      if(els.apiKeyInput) els.apiKeyInput.value='';
+      _refreshModelDropdownsAfterProviderChange();
+      await loadProvidersPanel();
+    }else{
+      showToast(res&&res.error||'Failed to save provider');
+      saveBtn.disabled=false;
+      saveBtn.textContent=prevLabel;
+    }
+  }catch(e){
+    showToast('Error: '+(e&&e.message||'Failed to save provider'));
+    saveBtn.disabled=false;
+    saveBtn.textContent=prevLabel;
   }
 }
 
