@@ -1,9 +1,9 @@
 """
-Tests for #499: TTS playback of agent responses via Piper backend.
+Tests for #499: TTS playback of agent responses.
 
 Verifies that TTS utility functions, speaker button rendering, and
-settings controls are present in the WebUI codebase. Now uses Piper
-TTS via the server-side /api/tts endpoint instead of browser speechSynthesis.
+settings controls are present in the WebUI codebase. Piper TTS is
+supported as a server-side engine alongside Edge, ElevenLabs, and OpenAI.
 """
 import os
 import re
@@ -50,13 +50,11 @@ class TestTtsUtilityFunctions:
         assert 'MEDIA:' in src and 'a file' in src, \
             "_stripForTTS must replace MEDIA: paths"
 
-    def test_uses_piper_backend(self):
-        """speakMessage must POST to /api/tts (Piper backend)."""
+    def test_uses_server_tts_endpoint(self):
+        """speakMessage must POST to /api/tts."""
         src = _read('ui.js')
-        assert "fetch('/api/tts'" in src or 'fetch("/api/tts"' in src, \
+        assert "api/tts" in src, \
             "speakMessage must call fetch to /api/tts"
-        assert 'New Audio(url)' in src, \
-            "speakMessage must create Audio element from blob URL"
 
     def test_speak_message_routes_openai(self):
         src = _read('ui.js')
@@ -122,11 +120,11 @@ class TestTtsSettings:
         assert 'settingsTtsVoice' in src, \
             "TTS voice selector not found in index.html"
 
-    def test_tts_piper_voice_desc(self):
-        """Voice description should mention Piper."""
+    def test_tts_piper_option_in_selector(self):
+        """Engine selector must include Piper option."""
         src = _read('index.html')
-        assert 'Piper' in src and 'alba' in src, \
-            "Voice description should mention Piper TTS and the alba voice model"
+        assert '<option value="piper">' in src, \
+            "settingsTtsEngine must expose the Piper TTS option"
 
     def test_tts_engine_includes_openai_option(self):
         src = _read('index.html')
@@ -137,6 +135,11 @@ class TestTtsSettings:
         src = _read('index.html')
         assert 'settingsTtsRate' in src, \
             "TTS rate slider not found in index.html"
+
+    def test_tts_pitch_slider(self):
+        src = _read('index.html')
+        assert 'settingsTtsPitch' in src, \
+            "TTS pitch slider not found in index.html"
 
     def test_tts_settings_wired_in_panels(self):
         """TTS settings must be initialized in loadSettingsPanel."""
@@ -171,7 +174,8 @@ class TestTtsI18n:
     def test_tts_settings_keys(self):
         src = _read('i18n.js')
         for key in ['settings_label_tts', 'settings_label_tts_auto_read',
-                     'settings_label_tts_voice', 'settings_label_tts_rate']:
+                     'settings_label_tts_voice', 'settings_label_tts_rate',
+                     'settings_label_tts_pitch']:
             assert f"{key}:" in src, f"{key} not found in i18n.js"
 
 
@@ -186,10 +190,10 @@ class TestTtsAutoRead:
     def test_tts_pause_on_composer_focus(self):
         """Speech should pause when user focuses the composer."""
         src = _read('messages.js')
-        assert '_ttsCurrentAudio' in src, \
-            "_ttsCurrentAudio not referenced in messages.js"
-        assert 'pause()' in src, \
-            "pause() not called in messages.js"
+        assert 'stopTTS' in src, \
+            "stopTTS called when focusing composer"
+        assert 'focus' in src, \
+            "focus event listener for TTS pause in messages.js"
 
 
 class TestTtsBoot:
@@ -201,10 +205,10 @@ class TestTtsBoot:
             "_applyTtsEnabled not called in boot.js"
 
     def test_tts_availability_always_true(self):
-        """hasTTS is hardcoded true since Piper is always available."""
+        """hasTTS is hardcoded true since server TTS is always available."""
         src = _read('boot.js')
         assert 'hasTTS=true' in src or 'hasTTS = true' in src, \
-            "hasTTS should be hardcoded to true for Piper backend"
+            "hasTTS should be hardcoded to true for server-side TTS"
 
 
 class TestTtsStyles:

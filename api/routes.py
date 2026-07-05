@@ -12844,6 +12844,8 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
 
+    if parsed.path == "/api/tts":
+        return _handle_tts(handler, parsed)
 
     if parsed.path == "/api/client-events/log":
         if diag:
@@ -12867,9 +12869,6 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         return True
-
-    if parsed.path == "/api/tts":
-        return _handle_tts(handler, body)
 
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)
@@ -16551,7 +16550,7 @@ def _handle_tts(handler, parsed):
     voice = "zh-CN-XiaoxiaoNeural"
     rate_str = ""
     pitch_str = ""
-    engine = "edge"  # "edge" | "elevenlabs" | "openai" | "browser" (browser is client-side only)
+    engine = "edge"  # "edge" | "piper" | "elevenlabs" | "openai" | "browser" (browser is client-side only)
 
     if handler.command != "POST":
         from api.helpers import bad as _bad
@@ -16794,6 +16793,10 @@ def _handle_tts(handler, parsed):
         except (BrokenPipeError, ConnectionResetError):
             pass
         return True
+
+    # ── Piper TTS ─────────────────────────────────────────────────────────
+    if engine == "piper":
+        return _handle_piper_tts(handler, text, voice, rate_str)
 
     # ── Edge TTS ────────────────────────────────────────────────────────
     allowed = {
@@ -24404,66 +24407,74 @@ def _handle_tts_voices(handler):
     return j(handler, {'voices': voices, 'default': 'en_GB-alba-medium'})
 
 
-def _handle_tts(handler, body):
-    """Synthesize text to speech via Piper, return OGG Opus audio."""
-    import tempfile
-
-    text = (body.get('text') or '').strip()
-    if not text:
-        return bad(handler, 'text is required')
-    if len(text) > 5000:
-        return bad(handler, 'text too long (max 5000 chars)')
+def _handle_piper_tts(handler, text, voice, rate_str):
+    """Synthesize text via Piper Python library (piper-tts), return OGG Opus."""
+    import io
+    import wave
 
     pip_dir = os.path.expanduser('~/piper/piper')
-    voice_name = (body.get('voice') or 'en_GB-alba-medium').strip()
+    voice_name = (voice or 'en_GB-alba-medium').strip()
     if not voice_name.endswith('.onnx'):
         voice_name += '.onnx'
-    voice = os.path.join(pip_dir, 'voices', voice_name)
+    voice_path = os.path.join(pip_dir, 'voices', voice_name)
 
-    if not os.path.isfile(voice):
-        return bad(handler, 'TTS voice not found', status=503)
+    if not os.path.isfile(voice_path):
+        from api.helpers import bad as _bad
+        return _bad(handler, 'Piper voice not found', status=503)
 
-    env = os.environ.copy()
-    env['LD_LIBRARY_PATH'] = pip_dir
-
-    # Write text to a temp file so piper can read it cleanly (avoids
-    # subprocess pipe deadlocks with the piper→ffmpeg pipeline).
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
     try:
-        tmp.write(text)
-        tmp.close()
+        import piper
+    except ImportError:
+        from api.helpers import bad as _bad
+        return _bad(handler, 'Piper TTS library not installed. Install with: pip install piper-tts', status=503)
 
-        with open(tmp.name) as text_file:
-            piper = subprocess.Popen(
-                ['./piper', '--model', voice, '--output-raw',
-                 '--sentence-silence', '0.4', '-f', '-'],
-                stdin=text_file, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, cwd=pip_dir, env=env,
-            )
-            ffmpeg = subprocess.Popen(
-                ['ffmpeg', '-y', '-f', 's16le', '-ar', '22050', '-ac', '1',
-                 '-i', '-', '-c:a', 'libopus', '-b:a', '24k', '-f', 'ogg', '-'],
-                stdin=piper.stdout, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            piper.stdout.close()
-            audio_data = ffmpeg.communicate()[0]
-            piper.wait()
-    except FileNotFoundError:
-        return bad(handler, 'TTS binary not found', status=503)
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        # Clean up lingering processes if anything went wrong
-        for _p in (piper, ffmpeg):
-            if _p.poll() is None:
-                _p.kill()
-                _p.wait()
+    try:
+        piper_voice = piper.PiperVoice.load(voice_path)
+    except Exception:
+        logger.exception("Failed to load Piper voice model")
+        from api.helpers import bad as _bad
+        return _bad(handler, 'Failed to load Piper voice model', status=503)
 
-    if ffmpeg.returncode != 0 or piper.returncode != 0:
-        return bad(handler, 'TTS synthesis failed', status=500)
+    length_scale = None
+    if rate_str:
+        m = __import__('re').search(r'([+-]?\d+)%', rate_str)
+        if m:
+            pct = int(m.group(1))
+            length_scale = max(0.3, min(3.0, 2.0 - (pct / 100.0)))
+
+    syn_config = piper.SynthesisConfig(length_scale=length_scale)
+
+    all_pcm = b''
+    try:
+        for chunk in piper_voice.synthesize(text, syn_config):
+            all_pcm += chunk.audio_int16_bytes
+    except Exception:
+        logger.exception("Piper synthesis failed")
+        from api.helpers import bad as _bad
+        return _bad(handler, 'Piper synthesis failed', status=500)
+
+    if not all_pcm:
+        from api.helpers import bad as _bad
+        return _bad(handler, 'Piper produced no audio', status=500)
+
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(piper_voice.config.sample_rate)
+        w.writeframes(all_pcm)
+
+    ffmpeg = subprocess.Popen(
+        ['ffmpeg', '-y', '-f', 'wav', '-i', '-',
+         '-c:a', 'libopus', '-b:a', '24k', '-f', 'ogg', '-'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    audio_data = ffmpeg.communicate(input=wav_buf.getvalue())[0]
+
+    if ffmpeg.returncode != 0:
+        from api.helpers import bad as _bad
+        return _bad(handler, 'Piper audio encoding failed', status=500)
 
     handler.send_response(200)
     handler.send_header('Content-Type', 'audio/ogg')
