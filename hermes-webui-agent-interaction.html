@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Hermes WebUI &harr; Agent Interaction</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; color: #222; background: #fafafa; }
+  h1 { border-bottom: 2px solid #ccc; padding-bottom: .4rem; }
+  h2 { margin-top: 2rem; color: #333; }
+  h3 { margin-top: 1.5rem; }
+  code, pre { background: #eee; border-radius: 4px; font-size: .9em; }
+  pre { padding: .8rem; overflow-x: auto; border: 1px solid #ddd; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { text-align: left; padding: .5rem .75rem; border: 1px solid #ddd; }
+  th { background: #e8e8e8; }
+  .layer { display: grid; grid-template-columns: auto 1fr auto; gap: .5rem 1rem; align-items: center; margin: 1rem 0; }
+  .layer-path { font-family: monospace; font-size: .9em; color: #555; }
+  .layer-desc { color: #333; }
+  .tag { display: inline-block; background: #ddf; padding: .15rem .5rem; border-radius: 3px; font-size: .8em; }
+</style>
+</head>
+<body>
+
+<h1>Hermes WebUI &harr; Agent Interaction</h1>
+<p>How the Hermes Web UI (this repo) loads, configures, and runs the Hermes Agent
+in-process. The WebUI imports agent Python modules directly — no subprocess,
+no external API, no IPC.</p>
+
+<h2>1. Architecture Layers</h2>
+
+<table>
+<tr><th>Layer</th><th>File</th><th>Role</th></tr>
+<tr><td>Entry point</td><td><code>server.py</code></td><td>HTTP routing shell, auth, TLS, startup</td></tr>
+<tr><td>API routes</td><td><code>api/routes.py</td><td>~9,700&nbsp;lines of if/elif route dispatch for all endpoints</td></tr>
+<tr><td>Streaming engine</td><td><code>api/streaming.py</code></td><td>SSE event loop, agent thread runner, cancellation, callbacks</td></tr>
+<tr><td>Config &amp; globals</td><td><code>api/config.py</code></td><td>Agent directory discovery, <code>sys.path</code> injection, model/provider resolution</td></tr>
+<tr><td>Profile bridge</td><td><code>api/profiles.py</code></td><td>Multi-profile switching, <code>HERMES_HOME</code> monkey-patching, credential isolation</td></tr>
+<tr><td>Session store</td><td><code>api/models.py</code></td><td>Session CRUD, JSON sidecars, LRU cache, Hermes state.db sync</td></tr>
+</table>
+
+<h2>2. Agent Discovery &amp; Import</h2>
+
+<p>At startup <code>api/config.py</code> searches for the hermes-agent checkout:</p>
+<pre>1. HERMES_WEBUI_AGENT_DIR env var (explicit override)
+2. $HERMES_HOME/hermes-agent          (e.g. ~/.hermes/hermes-agent)
+3. ../hermes-agent                     (sibling of this repo)
+4. ../../hermes-agent                  (nested parent layout)
+5. ~/.hermes/hermes-agent              (common install path)
+6. ~/hermes-agent                      (flat home layout)
+7. XDG_DATA_HOME / hermes-agent        (Linux standard)
+8. /opt, /usr/local, /usr/local/share  (system-wide)</pre>
+
+<p>Once found, the agent root is <strong>appended</strong> to <code>sys.path</code> (at the end, so
+<code>site-packages</code> pip packages take priority):</p>
+
+<pre>if _AGENT_DIR is not None:
+    if str(_AGENT_DIR) not in sys.path:
+        sys.path.append(str(_AGENT_DIR))</pre>
+
+<p>This makes every Hermes agent module importable: <code>run_agent</code>, <code>tools.*</code>,
+<code>cron.*</code>, <code>hermes_cli.*</code>, <code>agent.*</code>.</p>
+
+<h2>3. Chat Lifecycle (Browser &rarr; Agent &rarr; Browser)</h2>
+
+<h3>Step 1: <code>POST /api/chat/start</code></h3>
+<p><code>routes.py:_handle_chat_start</code> &rarr; <code>_start_run</code> &rarr;
+<code>_start_chat_stream_for_session</code>:</p>
+<ul>
+  <li>Validates session ID, message text, attachments</li>
+  <li>Resolves model/provider/profile via <code>resolve_model_provider()</code></li>
+  <li>Acquires per-session agent lock (prevents duplicate runs)</li>
+  <li>Creates an SSE queue channel, registers in <code>STREAMS[stream_id]</code></li>
+  <li>Appends a <code>turn_journal</code> event</li>
+  <li>Spawns a daemon thread running <code>_run_agent_streaming()</code></li>
+  <li>Returns <code>{stream_id, session_id}</code> immediately</li>
+</ul>
+
+<h3>Step 2: <code>GET /api/chat/stream?stream_id=X</code></h3>
+<p>Browser opens an <code>EventSource</code>. The server subscribes to the queue
+and streams events:</p>
+
+<table>
+<tr><th>SSE Event</th><th>Data Shape</th><th>When</th></tr>
+<tr><td><code>token</code></td><td><code>{"text": "..."}</code></td><td>Per-LLM-token delta</td></tr>
+<tr><td><code>reasoning</code></td><td><code>{"text": "..."}</code></td><td>Claude extended thinking / o3 reasoning blocks</td></tr>
+<tr><td><code>tool</code></td><td><code>{"name":"...", "args":..., "preview":"..."}</code></td><td>Tool invocation started</td></tr>
+<tr><td><code>tool_complete</code></td><td><code>{"name":"...", "result":...}</code></td><td>Tool returned</td></tr>
+<tr><td><code>approval</code></td><td><code>{"command":"...", "pattern_keys":[...]}</code></td><td>Dangerous command awaiting approval</td></tr>
+<tr><td><code>clarify</code></td><td><code>{"question":"...", "options":[...]}</code></td><td>Agent needs disambiguation</td></tr>
+<tr><td><code>done</code></td><td><code>{"session": {...}, "usage": {...}}</code></td><td>Agent finished successfully</td></tr>
+<tr><td><code>error</code></td><td><code>{"message":"...", "trace":"..."}</code></td><td>Exception occurred</td></tr>
+<tr><td><code>stream_end</code></td><td><code>{}</code></td><td>Clean stream close</td></tr>
+</table>
+
+<h3>Step 3: Inside <code>_run_agent_streaming()</code></h3>
+<p>This is the critical bridge, running in a background daemon thread. It lives
+in <code>api/streaming.py</code> (~line 6330&ndash;9900).</p>
+
+<h4>3a. Profile &amp; env setup</h4>
+<p>Sets thread-local <code>HERMES_HOME</code>, provider credentials, terminal config via
+<code>profile_env_for_background_worker()</code>. Also patches cron module path
+constants so in-chat cron tool calls resolve to the correct profile.</p>
+
+<h4>3b. Model resolution</h4>
+<pre>resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
+    model_with_provider_context(model, provider_context)
+)
+
+# Ask the Hermes runtime provider for the real API key + base_url
+from hermes_cli.runtime_provider import resolve_runtime_provider
+rt = resolve_runtime_provider(requested=resolved_provider,
+                              target_model=resolved_model)
+resolved_api_key  = rt.get("api_key")
+resolved_base_url = _runtime_preferred_base_url(rt, resolved_provider, ...)
+
+# For custom:* providers, also read custom_providers[] from config.yaml
+resolved_provider, resolved_api_key, resolved_base_url = \
+    _resolve_custom_provider_runtime_overrides(...)</pre>
+
+<h4>3c. AIAgent construction</h4>
+<pre>from run_agent import AIAgent   # lazy import, cached in _get_ai_agent()
+
+agent = AIAgent(
+    model=resolved_model,
+    provider=resolved_provider,
+    base_url=resolved_base_url,
+    api_key=resolved_api_key,
+    platform='webui',
+    quiet_mode=True,
+    enabled_toolsets=CLI_TOOLSETS,
+    session_id=session_id,
+    stream_delta_callback=on_token,       # &rarr; SSE 'token'
+    reasoning_callback=on_reasoning,       # &rarr; SSE 'reasoning'
+    tool_progress_callback=on_tool,        # &rarr; SSE 'tool' / 'tool_complete'
+    clarify_callback=...,                   # &rarr; SSE 'clarify'
+    tool_start_callback=on_tool_start,      # &rarr; SSE 'tool_start'
+    tool_complete_callback=on_tool_complete,# &rarr; SSE 'tool_complete'
+    status_callback=...,                    # &rarr; SSE 'status'
+    prefill_messages=_prefill_messages,     # recall / contextual prefill
+    fallback_model=...,                     # fallback on rate-limit
+    request_overrides=...,                  # provider-specific params
+)</pre>
+
+<h4>3d. Agent execution</h4>
+<pre>result = agent.run_conversation(
+    user_message=user_message,          # current user turn
+    system_message=workspace_system_msg, # workspace + personality
+    conversation_history=...,            # prior messages (with sanitization)
+    task_id=session_id,                  # NOTE: keyword is <em>task_id</em>, not session_id
+    persist_user_message=msg_text,       # plain-text variant for disk
+)</pre>
+
+<p>While the agent runs, every token, reasoning chunk, and tool invocation
+flows through the registered callbacks which <code>put()</code> events onto the
+shared SSE queue.</p>
+
+<h4>3e. Post-run writeback</h4>
+<ul>
+  <li>Merges agent-produced messages into <code>Session.messages</code></li>
+  <li>Persists to JSON sidecar (<code>~/.hermes/webui/sessions/{id}.json</code>)</li>
+  <li>Syncs token counts, cost, context-window metadata</li>
+  <li>Stamps tool calls, compression recovery state</li>
+  <li>Handles session-ID rotation on context compression</li>
+  <li>Emits <code>done</code> SSE event with full session + usage payload</li>
+  <li>Starts background title generation if needed</li>
+</ul>
+
+<h4>3f. Cleanup (finally block)</h4>
+<pre>finally:
+    _clear_thread_env()                          # restore env vars
+    with STREAMS_LOCK:
+        STREAMS.pop(stream_id, None)             # remove queue
+        CANCEL_FLAGS.pop(stream_id, None)         # remove cancel flag
+        AGENT_INSTANCES.pop(stream_id, None)      # drop agent ref
+        # ... also STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT, etc.</pre>
+
+<h2>4. Profile Isolation</h2>
+
+<p>The WebUI supports running multiple agent profiles simultaneously.
+Isolation is entirely in-process:</p>
+
+<h3>Per-request TLS</h3>
+<p><code>server.py</code> reads the <code>hermes_profile</code> cookie, calls
+<code>set_request_profile(name)</code>. <code>get_active_profile_name()</code>
+returns the thread-local value, falling back to the process-global
+<code>_active_profile</code>.</p>
+
+<h3>os.environ monkey-patching</h3>
+<p><code>profile_env_for_background_worker()</code>:</p>
+<ol>
+  <li>Saves current <code>os.environ</code> for known credential keys</li>
+  <li>Sets <code>HERMES_HOME</code> to the profile directory</li>
+  <li>Patches <code>cron.jobs.HERMES_DIR</code>, <code>cron.jobs.CRON_DIR</code>,
+    <code>cron.scheduler._hermes_home</code> module-level constants
+    (snapshotted at import time, so env-var alone is insufficient)</li>
+  <li>Scrubs credential env vars non-empty in the profile so empty profiles
+    don't inherit server-process API keys</li>
+  <li>Optionally installs a context-local <code>hermes_constants.set_hermes_home_override()</code>
+    (hermes-agent v0.18.0+) for race-free config resolution on concurrent
+    worker threads</li>
+  <li>Restores everything in the finally block</li>
+</ol>
+
+<h2>5. Coupling Points (what the WebUI imports from the agent)</h2>
+
+<table>
+<tr><th>Coupling</th><th>Location</th><th>Hermes module used</th></tr>
+<tr><td>Agent execution</td><td><code>streaming.py:565</code></td>
+  <td><code>run_agent.AIAgent</code></td></tr>
+<tr><td>Approval system</td><td><code>streaming.py:9640</code>, <code>server.py:618</code></td>
+  <td><code>tools.approval</code></td></tr>
+<tr><td>Profile switching</td><td><code>profiles.py</code></td>
+  <td><code>hermes_cli.profiles</code>, <code>cron.jobs</code>, <code>cron.scheduler</code></td></tr>
+<tr><td>Toolset discovery</td><td><code>config.py:1070</code></td>
+  <td><code>hermes_cli.tools_config._get_platform_tools</code></td></tr>
+<tr><td>Runtime provider</td><td><code>streaming.py:7595</code></td>
+  <td><code>hermes_cli.runtime_provider.resolve_runtime_provider</code></td></tr>
+<tr><td>Model config</td><td><code>config.py</code></td>
+  <td><code>hermes_cli.auth.PROVIDER_REGISTRY</code></td></tr>
+<tr><td>Secret scoping</td><td><code>profiles.py:1056</code></td>
+  <td><code>agent.secret_scope</code></td></tr>
+<tr><td>Cron operations</td><td><code>routes.py</code></td>
+  <td><code>cron.jobs</code>, <code>cron.scheduler</code></td></tr>
+<tr><td>Session sync</td><td><code>models.py</code></td>
+  <td>Hermes SQLite <code>state.db</code> schemas</td></tr>
+<tr><td>MP tool registry</td><td><code>streaming.py:228</code></td>
+  <td><code>tools.registry.registry</code></td></tr>
+<tr><td>Context-local home</td><td><code>profiles.py:1075</code></td>
+  <td><code>hermes_constants.set_hermes_home_override</code></td></tr>
+<tr><td>Skill modules</td><td><code>profiles.py:58</code></td>
+  <td><code>tools.skills_tool</code>, <code>tools.skill_manager_tool</code></td></tr>
+</table>
+
+<h2>6. Session Model</h2>
+
+<p>The <code>Session</code> class (<code>api/models.py:1027</code>) is a plain
+Python class (not a dataclass). Key fields:</p>
+
+<pre>session_id, title, workspace, model, model_provider, messages, tool_calls,
+created_at, updated_at, pinned, archived, project_id, profile,
+input_tokens, output_tokens, estimated_cost,
+cache_read_tokens, cache_write_tokens,
+personality, active_stream_id,
+pending_user_message, pending_attachments, pending_started_at,
+context_messages, compression_anchor_*,
+context_length, threshold_tokens, last_prompt_tokens,
+compression_recovery, truncation_watermark,
+gateway_routing, gateway_routing_history,
+worktree_path, worktree_branch, worktree_repo_root,
+composer_draft, anchor_activity_scenes</pre>
+
+<p>Sessions persist as individual JSON sidecars in
+<code>~/.hermes/webui/sessions/{id}.json</code>. A <code>_index.json</code>
+file provides O(1) sidebar listing without scanning all files. An in-memory
+LRU cache (<code>SESSIONS</code> dict, default cap 100) avoids re-reading
+recently accessed sessions.</p>
+
+<h2>7. The Agent Cache</h2>
+
+<p>To avoid re-creating the <code>AIAgent</code> instance for every turn,
+<code>_run_agent_streaming</code> (line 7807) builds a SHA-256 signature of
+(model, provider, base_url, api_key, toolsets). If a cached agent with a
+matching signature exists for this session, it reuses the instance and
+only refreshes the per-turn callbacks. Otherwise it creates a new agent
+and evicts the LRU oldest entry.</p>
+
+<h2>8. Frontend JS Modules</h2>
+
+<table>
+<tr><th>File</th><th>Lines</th><th>Role</th></tr>
+<tr><td><code>ui.js</code></td><td>~7,200</td><td>DOM helpers, <code>renderMd</code>, tool cards, context ring, file tree</td></tr>
+<tr><td><code>sessions.js</code></td><td>~3,500</td><td>Session CRUD, sidebar list, search, pin/archive/projects</td></tr>
+<tr><td><code>messages.js</code></td><td>~2,300</td><td><code>send()</code>, SSE event handlers, approval, transcript, recovery</td></tr>
+<tr><td><code>panels.js</code></td><td>~6,500</td><td>Cron, skills, memory, profiles, todos, settings (Control Center)</td></tr>
+<tr><td><code>commands.js</code></td><td>~1,300</td><td>Slash command autocomplete</td></tr>
+<tr><td><code>workspace.js</code></td><td>~370</td><td>File tree, preview, git badge, central <code>api()</code> fetch wrapper</td></tr>
+<tr><td><code>boot.js</code></td><td>~1,600</td><td>Event wiring, mobile nav, voice input, theme boot</td></tr>
+</table>
+
+<p>The browser communicates exclusively via HTTP <code>fetch()</code> / <code>EventSource</code>
+to the Python server. There is no WebSocket, no GraphQL, no build step —
+just JSON + SSE.</p>
+
+<h2>9. Key Design Decisions</h2>
+
+<table>
+<tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+<tr><td>Server</td><td><code>ThreadingHTTPServer</code></td><td>Python stdlib, no deps, synchronous agent calls fit threads</td></tr>
+<tr><td>Streaming</td><td>SSE over WebSocket</td><td>Unidirectional, no upgrade handshake, <code>EventSource</code> is standard</td></tr>
+<tr><td>State sharing</td><td>Module-level vars</td><td>Approval state (<code>tools.approval._pending</code>) shared across threads via same process</td></tr>
+<tr><td>Agent coupling</td><td>In-process import</td><td>Direct Python <code>import</code> from <code>sys.path</code>; tight coupling to source checkout</td></tr>
+<tr><td>Env isolation</td><td>Thread-local + os.environ save/restore</td><td><code>os.environ</code> is process-global; serialized with <code>_ENV_LOCK</code> for brief critical sections</td></tr>
+<tr><td>Auth</td><td>Optional, env-var-toggled</td><td>Localhost-only by default (SSH tunnel); password/passkey/OIDC opt-in for network exposure</td></tr>
+</table>
+
+<h2>10. Startup Sequence</h2>
+
+<pre>server.py:main()
+  ├─ install_crash_visibility()         (faulthandler + excepthooks)
+  ├─ print_startup_config()             (discovery results)
+  ├─ _raise_fd_soft_limit()
+  ├─ fix_credential_permissions()
+  ├─ recover_all_sessions_on_startup()  (restore .bak crash survivors)
+  ├─ verify_hermes_imports()            (try: from run_agent import AIAgent)
+  │  └─ auto_install_agent_deps()       (pip install on failure)
+  ├─ start_watcher()                    (gateway health monitor)
+  ├─ start_drain_thread()               (bg_task_complete drain)
+  ├─ start_session_channel_reaper()
+  ├─ load_plugins()
+  ├─ _abort_if_already_serving()
+  └─ httpd.serve_forever()              (ThreadingHTTPServer loop)</pre>
+
+<h2>11. Runtime Environment Variables</h2>
+
+<table>
+<tr><th>Variable</th><th>Set by WebUI for agent run</th><th>Purpose</th></tr>
+<tr><td><code>TERMINAL_CWD</code></td><td>&check;</td><td>Default cwd for terminal tool</td></tr>
+<tr><td><code>HERMES_EXEC_ASK</code></td><td>&check;</td><td><code>"1"</code> — enables approval gate</td></tr>
+<tr><td><code>HERMES_SESSION_KEY</code></td><td>&check;</td><td><code>session_id</code> — keys approval state</td></tr>
+<tr><td><code>HERMES_HOME</code></td><td>&check;</td><td>Active profile directory</td></tr>
+<tr><td><code>HERMES_WEBUI_ISOLATED_PROFILE</code></td><td>startup only</td><td>Locks to single profile (multi-user deploy)</td></tr>
+</table>
+
+<p>These are set on <code>os.environ</code> (with <code>_ENV_LOCK</code>
+serialization) before each agent run and restored in the finally block.</p>
+
+<hr>
+<p style="font-size:.85em; color:#666;">Generated from hermes-webui commit HEAD &mdash; see <code>ARCHITECTURE.md</code> and
+<code>docs/CONTRACTS.md</code> for the canonical contracts.</p>
+
+</body>
+</html>
