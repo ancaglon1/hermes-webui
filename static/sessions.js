@@ -505,15 +505,24 @@ function _saveSessionCompletionUnread() {
   }
 }
 
-function _markSessionCompletionUnread(sid, messageCount = 0) {
+function _markSessionCompletionUnread(sid, messageCount = 0, meta = null) {
   if (!sid) return;
   const unread = _getSessionCompletionUnread();
   const count = Number.isFinite(messageCount) ? Number(messageCount) : 0;
-  unread[sid] = {message_count: count, completed_at: Date.now()};
+  const entry = {message_count: count, completed_at: Date.now()};
+  // Cron markers carry source+profile so profile switches can clear only that
+  // cross-profile leak without wiping ordinary chat completion unread (#5960).
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (meta.source) entry.source = String(meta.source);
+    if (typeof meta.profile === 'string' && meta.profile.trim()) {
+      entry.profile = meta.profile.trim();
+    }
+  }
+  unread[sid] = entry;
   _saveSessionCompletionUnread();
 }
 
-function _markSessionCompletionUnreadIfBackground(sid, messageCount = null) {
+function _markSessionCompletionUnreadIfBackground(sid, messageCount = null, meta = null) {
   if (!sid) return false;
   let count = Number.isFinite(messageCount) ? Number(messageCount) : NaN;
   if (!Number.isFinite(count)) {
@@ -527,7 +536,7 @@ function _markSessionCompletionUnreadIfBackground(sid, messageCount = null) {
     if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
     return false;
   }
-  _markSessionCompletionUnread(sid, count);
+  _markSessionCompletionUnread(sid, count, meta);
   if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
   return true;
 }
@@ -538,6 +547,132 @@ function _clearSessionCompletionUnread(sid) {
   if (!Object.prototype.hasOwnProperty.call(unread, sid)) return;
   delete unread[sid];
   _saveSessionCompletionUnread();
+}
+
+// True when a session row is a cron-origin session for unread-dot scoping.
+function _isCronSessionForUnread(session) {
+  if (!session) return false;
+  const key = (typeof _sourceKeyForSession === 'function')
+    ? _sourceKeyForSession(session)
+    : String(
+      session.raw_source
+      || session.source_tag
+      || session.source
+      || session.session_source
+      || ''
+    ).toLowerCase();
+  if (key === 'cron') return true;
+  return String(session.session_source || '').toLowerCase() === 'cron';
+}
+
+// Build {source, profile} for a cron session row; null for ordinary chat.
+function _cronCompletionUnreadMetaForSession(session) {
+  if (!_isCronSessionForUnread(session)) return null;
+  const fromRow = (session && typeof session.profile === 'string' && session.profile.trim())
+    ? session.profile.trim()
+    : '';
+  const active = (typeof S !== 'undefined' && S && typeof S.activeProfile === 'string' && S.activeProfile.trim())
+    ? S.activeProfile.trim()
+    : 'default';
+  return {source: 'cron', profile: fromRow || active};
+}
+
+// Resolve whether a persisted marker is cron and which profile owns it.
+// Untagged/legacy markers are migrated from the sidebar session row when known.
+function _resolveCronCompletionMarkerOrigin(sid, marker) {
+  let isCron = !!(marker && marker.source === 'cron');
+  let profile = (marker && typeof marker.profile === 'string' && marker.profile.trim())
+    ? marker.profile.trim()
+    : '';
+  let session = null;
+  if (Array.isArray(_allSessions)) {
+    session = _allSessions.find((s) => s && s.session_id === sid) || null;
+  }
+  if (!session && typeof _sessionListSnapshotById !== 'undefined'
+    && _sessionListSnapshotById && typeof _sessionListSnapshotById.get === 'function') {
+    // Snapshot alone lacks source/profile; keep null.
+    session = null;
+  }
+  if (session) {
+    if (!isCron && _isCronSessionForUnread(session)) isCron = true;
+    if (!profile) {
+      const sp = (typeof session.profile === 'string' && session.profile.trim())
+        ? session.profile.trim()
+        : '';
+      if (sp) profile = sp;
+    }
+  }
+  // Persist migration so later switches don't re-resolve from a cleared list.
+  if (marker && isCron) {
+    if (marker.source !== 'cron') marker.source = 'cron';
+    if (profile && marker.profile !== profile) marker.profile = profile;
+  }
+  return {isCron, profile: profile || ''};
+}
+
+// A profile name provably resolving to the root profile: the literal
+// 'default' alias, or a roster entry flagged is_default (renamed root).
+// Unknown names fail closed — exact-name matching still applies to them.
+function _cronProfileNameIsRootAlias(name) {
+  if (name === 'default') return true;
+  if (typeof _profilesCache !== 'undefined' && _profilesCache
+    && Array.isArray(_profilesCache.profiles)) {
+    const entry = _profilesCache.profiles.find((p) => p && p.name === name);
+    if (entry && entry.is_default) return true;
+  }
+  return false;
+}
+
+// default/renamed-root equivalence for cron-marker ownership (mirrors server
+// _profiles_match enough for the active surface: literal 'default' ↔ root).
+function _cronMarkerProfileMatchesActive(origin, activeProfile) {
+  const originName = (typeof origin === 'string' && origin.trim()) ? origin.trim() : '';
+  const activeName = (typeof activeProfile === 'string' && activeProfile.trim())
+    ? activeProfile.trim()
+    : 'default';
+  if (!originName) return false;
+  if (originName === activeName) return true;
+  if (typeof _profileMatchesActiveProfile === 'function'
+    && _profileMatchesActiveProfile(originName, activeName)) {
+    return true;
+  }
+  // Reverse alias: marker tagged with the renamed-root name while the active
+  // root surface reports a different alias. Match only when the origin name
+  // ITSELF provably resolves to the root — never "active is default → match
+  // all", which under-cleared other profiles' markers on switch to 'default'.
+  if (typeof S !== 'undefined' && S && S.activeProfileIsDefault
+    && typeof _cronProfileNameIsRootAlias === 'function'
+    && _cronProfileNameIsRootAlias(originName)) {
+    return true;
+  }
+  return false;
+}
+
+// Drop persisted cron unread dots that belong to inactive profiles. Ordinary
+// (non-cron) completion markers stay put — sticky all-profile sidebars still
+// need those. Called from the shared profile-switch reset in panels.js.
+function _clearCronSessionCompletionUnreadForInactiveProfiles(activeProfile) {
+  const active = (typeof activeProfile === 'string' && activeProfile.trim())
+    ? activeProfile.trim()
+    : 'default';
+  const unread = _getSessionCompletionUnread();
+  let changed = false;
+  for (const sid of Object.keys(unread)) {
+    const marker = unread[sid];
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) continue;
+    const resolved = _resolveCronCompletionMarkerOrigin(sid, marker);
+    if (!resolved.isCron) continue;
+    // Only clear when we know the owning profile AND it is not the active one
+    // (incl. default/renamed-root equivalence). Untagged + unresolvable stays.
+    if (!resolved.profile) continue;
+    if (_cronMarkerProfileMatchesActive(resolved.profile, active)) continue;
+    delete unread[sid];
+    changed = true;
+  }
+  if (!changed) return false;
+  _saveSessionCompletionUnread();
+  if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+  return true;
 }
 
 function _clearSessionViewedCount(sid) {
@@ -1049,7 +1184,26 @@ function _markPollingCompletionUnreadTransitions(sessions) {
     const completedPersistedObservedStream = Boolean(observedStreaming && !isStreaming);
     if (completedObservedStream || completedPersistedObservedStream || completedWithNewMessages) {
       if (!_isSessionActivelyViewedForList(sid)) {
-        _markSessionCompletionUnread(sid, s.message_count);
+        // Tag cron session-list markers with source+profile so profile-switch
+        // reset can clear only inactive-profile cron dots (#5960 / #5975 re-gate).
+        const meta = (typeof _cronCompletionUnreadMetaForSession === 'function')
+          ? _cronCompletionUnreadMetaForSession(s)
+          : null;
+        // Defense: never re-create a cron unread for a non-active profile while
+        // the sidebar is single-profile (stale pre-switch payloads).
+        const allProfilesOn = (typeof _showAllProfiles !== 'undefined' && !!_showAllProfiles);
+        if (
+          meta
+          && meta.source === 'cron'
+          && meta.profile
+          && !allProfilesOn
+          && typeof _cronMarkerProfileMatchesActive === 'function'
+          && !_cronMarkerProfileMatchesActive(meta.profile, (typeof S !== 'undefined' && S && S.activeProfile) || 'default')
+        ) {
+          // Skip mark for inactive-profile cron row.
+        } else {
+          _markSessionCompletionUnread(sid, s.message_count, meta);
+        }
       } else {
         // Sync viewed count so we don't flag stale unread on tab switch (#3020)
         _setSessionViewedCount(sid, messageCount);
@@ -1208,7 +1362,11 @@ async function newSession(flash, options={}){
       profile:S.activeProfile||'default',
     };
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
-    if(options&&options.worktree) reqBody.worktree=true;
+    // Three-value worktree contract (#6022): explicit true/false is forwarded
+    // verbatim; an ABSENT key lets the server apply the agent's config-level
+    // `worktree:` default. Auto-bind paths pass worktree:false explicitly so a
+    // config default can never mint a worktree (+ branch) on mere page load.
+    if(options&&Object.prototype.hasOwnProperty.call(options,'worktree')) reqBody.worktree=!!options.worktree;
     if(Object.prototype.hasOwnProperty.call(options,'project_id')){
       reqBody.project_id=options.project_id;
     } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
@@ -1438,6 +1596,9 @@ async function _switchProfileForSessionLoad(profile){
     const data=await api('/api/profile/switch',{method:'POST',body:JSON.stringify({name}),timeoutToast:false});
     S.activeProfile=data.active||name;
     S.activeProfileIsDefault=!!data.is_default;
+    if(typeof _resetCronUnreadForProfileSwitch==='function'){
+      _resetCronUnreadForProfileSwitch();
+    }
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     if(data.default_model) window._defaultModel=data.default_model;
@@ -3620,6 +3781,8 @@ _restoreSessionSourceFilter();
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
+let _sessionActionMenuId = 0;
+let _sessionActionPreviousFocus = null;
 const _expandedChildSessionKeys = new Set();
 const _expandedLineageKeys = new Set();
 const _lineageReportCache = new Map();
@@ -4018,7 +4181,15 @@ function _showBatchProjectPicker(){
   setTimeout(()=>document.addEventListener('click',close),0);
 }
 
-function closeSessionActionMenu(){
+function _focusSessionActionMenuRestoreTarget(target){
+  if(!target||!target.isConnected||typeof target.focus!=='function') return false;
+  try{target.focus({preventScroll:true});}catch(_){target.focus();}
+  return document.activeElement===target;
+}
+
+function closeSessionActionMenu({restoreFocus=false}={}){
+  const focusTarget=restoreFocus?_sessionActionAnchor:null;
+  const fallbackFocusTarget=restoreFocus?_sessionActionPreviousFocus:null;
   if(_sessionActionMenu){
     _sessionActionMenu.remove();
     _sessionActionMenu = null;
@@ -4026,12 +4197,16 @@ function closeSessionActionMenu(){
   if(_sessionActionAnchor){
     if(_sessionActionAnchor.classList&&_sessionActionAnchor.classList.contains('session-actions-trigger')){
       _sessionActionAnchor.classList.remove('active');
+      _sessionActionAnchor.setAttribute('aria-expanded','false');
+      _sessionActionAnchor.removeAttribute('aria-controls');
     }
     const row=_sessionActionAnchor.closest('.session-item,.session-child-session');
     if(row) row.classList.remove('menu-open','long-pressing');
     _sessionActionAnchor = null;
   }
   _sessionActionSessionId = null;
+  _sessionActionPreviousFocus = null;
+  if(!_focusSessionActionMenuRestoreTarget(focusTarget)) _focusSessionActionMenuRestoreTarget(fallbackFocusTarget);
 }
 
 function _sessionActionMenuShouldIgnoreScrollTarget(target){
@@ -4083,6 +4258,7 @@ function _buildSessionAction(label, meta, icon, onSelect, extraClass=''){
   const opt=document.createElement('button');
   opt.type='button';
   opt.className='ws-opt session-action-opt'+(extraClass?` ${extraClass}`:'');
+  opt.setAttribute('role','menuitem');
   // Compact context-menu shape (#3223 redesign, Nathan 2026-06-01): show only
   // icon + label, matching VS Code / browser / ChatGPT conversation menus. The
   // descriptive `meta` is preserved as a hover tooltip (title=) so the
@@ -4152,15 +4328,44 @@ async function _copySessionLink(session){
 }
 
 function _mountSessionActionMenu(menu, session, anchorEl){
+  _sessionActionPreviousFocus=document.activeElement;
   document.body.appendChild(menu);
   _sessionActionMenu = menu;
   _sessionActionAnchor = anchorEl;
   _sessionActionSessionId = session.session_id;
-  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')) anchorEl.classList.add('active');
+  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')){
+    anchorEl.classList.add('active');
+    anchorEl.setAttribute('aria-expanded','true');
+    anchorEl.setAttribute('aria-controls',menu.id);
+  }
   const row=anchorEl.closest('.session-item,.session-child-session');
   if(row) row.classList.add('menu-open');
   _positionSessionActionMenu(anchorEl);
   _playSessionActionMenuEntrance(menu);
+  const menuItems=()=>Array.from(menu.querySelectorAll('.session-action-opt:not([disabled])'));
+  menu.addEventListener('keydown',e=>{
+    const items=menuItems();
+    if(e.key==='Escape'){
+      e.preventDefault();
+      e.stopPropagation();
+      closeSessionActionMenu({restoreFocus:true});
+      return;
+    }
+    if(!items.length) return;
+    const currentIndex=Math.max(0,items.indexOf(document.activeElement));
+    let nextIndex=null;
+    if(e.key==='ArrowDown') nextIndex=(currentIndex+1)%items.length;
+    else if(e.key==='ArrowUp') nextIndex=(currentIndex-1+items.length)%items.length;
+    else if(e.key==='Home') nextIndex=0;
+    else if(e.key==='End') nextIndex=items.length-1;
+    if(nextIndex===null) return;
+    e.preventDefault();
+    try{items[nextIndex].focus({preventScroll:true});}catch(_){items[nextIndex].focus();}
+  });
+  const firstAction=menuItems()[0];
+  if(firstAction){
+    try{firstAction.focus({preventScroll:true});}catch(_){firstAction.focus();}
+  }
 }
 
 function _findSessionRenameRow(sessionId){
@@ -4465,6 +4670,9 @@ function _openSessionActionMenu(session, anchorEl){
   const isExternalSession = isMessagingSession || isCliSession;
   const menu=document.createElement('div');
   menu.className='session-action-menu';
+  menu.id='sessionActionMenu-'+(++_sessionActionMenuId);
+  menu.setAttribute('role','menu');
+  menu.setAttribute('aria-label', 'Conversation actions');
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
@@ -4655,7 +4863,7 @@ document.addEventListener('scroll',e=>{
   closeSessionActionMenu();
 }, true);
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape' && _sessionActionMenu) closeSessionActionMenu();
+  if(e.key==='Escape' && _sessionActionMenu) closeSessionActionMenu({restoreFocus:true});
 });
 window.addEventListener('resize',()=>{
   if(_sessionActionMenu && _sessionActionAnchor) _positionSessionActionMenu(_sessionActionAnchor);
@@ -4913,7 +5121,11 @@ function _schedulePendingSessionListApply(){
     const payload=_pendingSessionListPayload;
     _pendingSessionListPayload=null;
     if(payload.gen!==_renderSessionListGen) return;
-    _applySessionListPayload(payload.sessData,payload.projData);
+    // Profile switch may have bumped unread gen after the list gen check
+    // window; still drop completion-marking for the stale pre-switch payload.
+    _applySessionListPayload(payload.sessData,payload.projData,{
+      unreadGen:payload.unreadGen,
+    });
   }, Math.max(120, SESSION_LIST_INTERACTION_IDLE_MS));
 }
 
@@ -4983,10 +5195,11 @@ function _sessionListRenderSignature(){
     ]);
   }catch(_){ return null; }
 }
-function _applySessionListPayload(sessData, projData){
+function _applySessionListPayload(sessData, projData, opts){
   // Server's other_profile_count tells us how many sessions exist outside the
   // active profile so the "Show N from other profiles" toggle can render
   // without a second round-trip. Stashed on the module for renderSessionListFromCache.
+  const applyOpts = (opts && typeof opts === 'object') ? opts : {};
   _otherProfileCount = sessData.other_profile_count || 0;
   _archivedWebuiCount = Number(sessData.archived_webui_count ?? sessData.archived_count ?? 0);
   _archivedCliCount = Number(sessData.archived_cli_count ?? 0);
@@ -5050,7 +5263,16 @@ function _applySessionListPayload(sessData, projData){
   const _hadSessionListLoadError = !!_sessionListLoadError;
   _sessionListLoadError = null;
   _sessionListHasLoadedOnce = true;
-  _markPollingCompletionUnreadTransitions(_allSessions);
+  // Greptile #5975 P1: a /api/sessions request started under profile A can
+  // finish after a switch to B already cleared A's cron markers. The list gen
+  // check can already have passed (TOCTOU) or a deferred apply can land later.
+  // Re-validate the profile-switch unread generation (shared with cron poll
+  // reset via _cronPollGeneration) immediately before marking completions.
+  const expectedUnreadGen = applyOpts.unreadGen;
+  const currentUnreadGen = (typeof _cronPollGeneration === 'number') ? _cronPollGeneration : 0;
+  if (typeof expectedUnreadGen !== 'number' || expectedUnreadGen === currentUnreadGen) {
+    _markPollingCompletionUnreadTransitions(_allSessions);
+  }
   const isStreaming = _allSessions.some(s => _isSessionEffectivelyStreaming(s));
   if (isStreaming) {
     startStreamingPoll();
@@ -5189,6 +5411,10 @@ function _renderSessionListLoadErrorNote(){
 async function _runRenderSessionListRefresh(opts, _gen){
   const deferWhileInteracting=Boolean(opts&&opts.deferWhileInteracting);
   if(!deferWhileInteracting) _pendingSessionListPayload=null;
+  // Capture profile-switch unread generation BEFORE the await so a switch
+  // mid-flight (which increments _cronPollGeneration) invalidates completion
+  // marking for this response even if list gen checks already passed.
+  const unreadGen = (typeof _cronPollGeneration === 'number') ? _cronPollGeneration : 0;
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
     const sessionListQS = _sessionListQueryString();
@@ -5217,11 +5443,11 @@ async function _runRenderSessionListRefresh(opts, _gen){
     // renderSessionList(), so that render's payload is the first allowed to paint.
     if (_profileSwitchListEmbargo) return;
     if(deferWhileInteracting&&_isSessionListUserInteracting()){
-      _pendingSessionListPayload={gen:_gen,sessData,projData};
+      _pendingSessionListPayload={gen:_gen,sessData,projData,unreadGen};
       _schedulePendingSessionListApply();
       return;
     }
-    _applySessionListPayload(sessData,projData);
+    _applySessionListPayload(sessData,projData,{unreadGen});
   }catch(e){
     if (_gen !== _renderSessionListGen) return;
     // #4671: same embargo guard as the success path — a mid-switch /api/sessions that
@@ -8075,6 +8301,7 @@ function renderSessionListFromCache(){
             menuBtn.className='session-actions-trigger';
             menuBtn.title='Conversation actions';
             menuBtn.setAttribute('aria-haspopup','menu');
+            menuBtn.setAttribute('aria-expanded','false');
             menuBtn.setAttribute('aria-label','Conversation actions');
             menuBtn.innerHTML=ICONS.more;
             const stopMenuPointer=(e)=>e.stopPropagation();
@@ -8173,6 +8400,7 @@ function renderSessionListFromCache(){
       menuBtn.className='session-actions-trigger';
       menuBtn.title='Conversation actions';
       menuBtn.setAttribute('aria-haspopup','menu');
+      menuBtn.setAttribute('aria-expanded','false');
       menuBtn.setAttribute('aria-label','Conversation actions');
       menuBtn.innerHTML=ICONS.more;
       const stopMenuPointer=(e)=>e.stopPropagation();
